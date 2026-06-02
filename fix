@@ -1,0 +1,484 @@
+-- Murder Duels | boyoftheboy
+-- Fixed: Deferred hook installation, scoped targeting, proper cleanup
+
+local success, Rayfield = pcall(function()
+    return loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+end)
+
+if not success or not Rayfield then
+    warn("Failed to load Rayfield")
+    return
+end
+
+-- ========== CREATE WINDOW FIRST ==========
+local Window = Rayfield:CreateWindow({
+    Name = "Murder Duels | boyoftheboy",
+    LoadingTitle = "Murder Duels Hub",
+    LoadingSubtitle = "by boyoftheboy",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "MurderDuels",
+        FileName = "Settings"
+    },
+    KeySystem = false
+})
+
+-- ========== CREATE ALL TABS & UI ELEMENTS ==========
+local CombatTab = Window:CreateTab("Combat", 4483362458)
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+local Camera = Workspace.CurrentCamera
+
+-- Settings table
+local Settings = {
+    SilentAim = false,
+    Aimbot = false,
+    AimbotSmoothness = 0.5,
+    AimbotFOV = 100,
+    SilentAimFOV = 150,
+    TeamCheck = true,
+    WallCheck = true,
+    ShowFOV = true,
+    SpeedEnabled = false,
+    SpeedValue = 50
+}
+
+-- ========== HOOK MANAGEMENT VARIABLES ==========
+local SilentAimHookInstalled = false
+local OriginalNamecall = nil
+local hookmetamethod = getfenv().hookmetamethod
+local getnamecallmethod = getfenv().getnamecallmethod
+local newcclosure = getfenv().newcclosure or function(f) return f end
+
+-- ========== UTILITY FUNCTIONS ==========
+
+-- Check if a remote looks like a weapon remote based on common patterns
+local function IsLikelyWeaponRemote(remote)
+    if not remote or not remote:IsA("RemoteEvent") and not remote:IsA("RemoteFunction") then
+        return false
+    end
+    
+    local name = remote.Name:lower()
+    -- Common weapon remote naming patterns
+    return name:find("weapon") or 
+           name:find("shoot") or 
+           name:find("fire") or 
+           name:find("hit") or
+           name:find("damage") or
+           name:find("attack") or
+           name:find("slash") or
+           name:find("stab") or
+           name:find("throw") or
+           name:find("knife") or
+           name:find("gun")
+end
+
+-- Check if arguments look like weapon fire data (position/direction based)
+local function IsWeaponFireData(args)
+    if #args == 0 then return false end
+    
+    -- Weapon fires usually have CFrame, Vector3, or BasePart as first few args
+    for i = 1, math.min(3, #args) do
+        local arg = args[i]
+        if typeof(arg) == "CFrame" or typeof(arg) == "Vector3" then
+            return true
+        end
+        if typeof(arg) == "Instance" and arg:IsA("BasePart") then
+            return true
+        end
+    end
+    return false
+end
+
+-- Get closest player function
+local function GetClosestPlayer(maxDistance)
+    local closestPlayer = nil
+    local shortestDistance = math.huge
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("Humanoid") then
+            if player.Character.Humanoid.Health > 0 then
+                if not Settings.TeamCheck or player.Team ~= LocalPlayer.Team then
+                    local head = player.Character:FindFirstChild("Head")
+                    local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+                    local targetPart = head or rootPart
+                    
+                    if targetPart then
+                        local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                        if onScreen then
+                            local distance = (Vector2.new(Mouse.X, Mouse.Y) - Vector2.new(screenPos.X, screenPos.Y)).Magnitude
+                            if distance < shortestDistance and distance <= maxDistance then
+                                if not Settings.WallCheck then
+                                    shortestDistance = distance
+                                    closestPlayer = player
+                                else
+                                    local rayParams = RaycastParams.new()
+                                    rayParams.FilterDescendantsInstances = {LocalPlayer.Character}
+                                    rayParams.FilterType = Enum.RaycastFilterType.Blacklist
+                                    local ray = Workspace:Raycast(Camera.CFrame.Position, (targetPart.Position - Camera.CFrame.Position).Unit * 1000, rayParams)
+                                    if not ray or (ray.Instance and ray.Instance:IsDescendantOf(player.Character)) then
+                                        shortestDistance = distance
+                                        closestPlayer = player
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return closestPlayer
+end
+
+-- ========== SILENT AIM HOOK ==========
+local function InstallSilentAimHook()
+    if SilentAimHookInstalled then return end
+    if not (hookmetamethod and getnamecallmethod) then return end
+    
+    OriginalNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local args = {...}
+        local method = getnamecallmethod()
+        
+        -- CRITICAL: If Silent Aim is disabled, pass through immediately without touching anything
+        if not Settings.SilentAim then
+            return OriginalNamecall(self, ...)
+        end
+        
+        -- Only process FireServer/InvokeServer
+        if method ~= "FireServer" and method ~= "InvokeServer" then
+            return OriginalNamecall(self, ...)
+        end
+        
+        -- Only process likely weapon remotes
+        if not IsLikelyWeaponRemote(self) then
+            return OriginalNamecall(self, ...)
+        end
+        
+        -- Only process if args look like weapon fire data
+        if not IsWeaponFireData(args) then
+            return OriginalNamecall(self, ...)
+        end
+        
+        -- Now we can safely assume this is a weapon fire
+        local target = GetClosestPlayer(Settings.SilentAimFOV)
+        if target and target.Character then
+            local head = target.Character:FindFirstChild("Head")
+            local rootPart = target.Character:FindFirstChild("HumanoidRootPart")
+            local aimPos = head and head.Position or (rootPart and rootPart.Position)
+            
+            if aimPos then
+                for i, arg in ipairs(args) do
+                    if typeof(arg) == "CFrame" then
+                        args[i] = CFrame.new(aimPos)
+                    elseif typeof(arg) == "Vector3" then
+                        args[i] = aimPos
+                    elseif typeof(arg) == "Instance" and arg:IsA("BasePart") then
+                        if not arg:IsDescendantOf(target.Character) then
+                            args[i] = head or rootPart
+                        end
+                    end
+                end
+            end
+        end
+        
+        return OriginalNamecall(self, unpack(args))
+    end))
+    
+    SilentAimHookInstalled = true
+end
+
+-- ========== UI CREATION ==========
+
+-- Combat Tab UI
+CombatTab:CreateSection("Aimbot")
+
+CombatTab:CreateToggle({
+    Name = "Aimbot (Hold RMB)",
+    CurrentValue = false,
+    Flag = "Aimbot",
+    Callback = function(Value)
+        Settings.Aimbot = Value
+    end
+})
+
+CombatTab:CreateSlider({
+    Name = "Smoothness",
+    Range = {0.1, 1},
+    Increment = 0.1,
+    CurrentValue = 0.5,
+    Flag = "Smoothness",
+    Callback = function(Value)
+        Settings.AimbotSmoothness = Value
+    end
+})
+
+CombatTab:CreateSlider({
+    Name = "Aimbot FOV",
+    Range = {50, 500},
+    Increment = 10,
+    Suffix = "px",
+    CurrentValue = 100,
+    Flag = "AimbotFOV",
+    Callback = function(Value)
+        Settings.AimbotFOV = Value
+    end
+})
+
+CombatTab:CreateSection("Silent Aim")
+
+CombatTab:CreateToggle({
+    Name = "Silent Aim",
+    CurrentValue = false,
+    Flag = "SilentAim",
+    Callback = function(Value)
+        Settings.SilentAim = Value
+        
+        if Value then
+            -- Install hook when enabled
+            local success, err = pcall(InstallSilentAimHook)
+            if not success then
+                warn("Failed to install Silent Aim hook: " .. tostring(err))
+                Rayfield:Notify({
+                    Title = "Silent Aim Error",
+                    Content = "Failed to initialize: " .. tostring(err),
+                    Duration = 5
+                })
+                Settings.SilentAim = false
+            elseif not SilentAimHookInstalled then
+                Rayfield:Notify({
+                    Title = "Silent Aim",
+                    Content = "Hook not available on this executor",
+                    Duration = 5
+                })
+                Settings.SilentAim = false
+            else
+                Rayfield:Notify({
+                    Title = "Silent Aim",
+                    Content = "Enabled - Hook active",
+                    Duration = 3
+                })
+            end
+        else
+            Rayfield:Notify({
+                Title = "Silent Aim",
+                Content = "Disabled",
+                Duration = 3
+            })
+        end
+    end
+})
+
+CombatTab:CreateSlider({
+    Name = "Silent Aim FOV",
+    Range = {50, 500},
+    Increment = 10,
+    Suffix = "px",
+    CurrentValue = 150,
+    Flag = "SilentAimFOV",
+    Callback = function(Value)
+        Settings.SilentAimFOV = Value
+    end
+})
+
+CombatTab:CreateSection("Settings")
+
+CombatTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = true,
+    Flag = "TeamCheck",
+    Callback = function(Value)
+        Settings.TeamCheck = Value
+    end
+})
+
+CombatTab:CreateToggle({
+    Name = "Wall Check",
+    CurrentValue = true,
+    Flag = "WallCheck",
+    Callback = function(Value)
+        Settings.WallCheck = Value
+    end
+})
+
+CombatTab:CreateToggle({
+    Name = "Show FOV Circles",
+    CurrentValue = true,
+    Flag = "ShowFOV",
+    Callback = function(Value)
+        Settings.ShowFOV = Value
+    end
+})
+
+-- Misc Tab UI
+MiscTab:CreateSection("Movement")
+
+MiscTab:CreateToggle({
+    Name = "Speed Hack",
+    CurrentValue = false,
+    Flag = "SpeedHack",
+    Callback = function(Value)
+        Settings.SpeedEnabled = Value
+    end
+})
+
+MiscTab:CreateSlider({
+    Name = "Speed",
+    Range = {16, 200},
+    Increment = 5,
+    CurrentValue = 50,
+    Flag = "SpeedValue",
+    Callback = function(Value)
+        Settings.SpeedValue = Value
+    end
+})
+
+MiscTab:CreateSection("Game")
+
+MiscTab:CreateButton({
+    Name = "Fullbright",
+    Callback = function()
+        local lighting = game:GetService("Lighting")
+        lighting.Brightness = 10
+        lighting.GlobalShadows = false
+        lighting.Ambient = Color3.new(1, 1, 1)
+        lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+    end
+})
+
+MiscTab:CreateButton({
+    Name = "Anti-AFK",
+    Callback = function()
+        local vu = game:GetService("VirtualUser")
+        local player = game:GetService("Players").LocalPlayer
+        local camera = game:GetService("Workspace").CurrentCamera
+        player.Idled:Connect(function()
+            vu:Button2Down(Vector2.new(0,0), camera.CFrame)
+            task.wait(1)
+            vu:Button2Up(Vector2.new(0,0), camera.CFrame)
+        end)
+        Rayfield:Notify({
+            Title = "Anti-AFK",
+            Content = "Anti-AFK has been enabled!",
+            Duration = 3
+        })
+    end
+})
+
+-- Notify that UI loaded
+Rayfield:Notify({
+    Title = "Murder Duels Hub",
+    Content = "UI Loaded - Ready for use",
+    Duration = 3,
+    Image = 4483362458
+})
+
+-- ========== RISKY CODE AFTER UI IS CREATED ==========
+
+-- Protected Drawing API setup
+local FOVCircle, SilentAimCircle, DrawingsOK
+local DrawSuccess, DrawErr = pcall(function()
+    FOVCircle = Drawing.new("Circle")
+    SilentAimCircle = Drawing.new("Circle")
+    FOVCircle.Filled = false
+    SilentAimCircle.Filled = false
+    DrawingsOK = true
+end)
+
+if not DrawSuccess then
+    warn("Drawing API not supported: " .. tostring(DrawErr))
+end
+
+-- Main loop
+local RSConnection
+pcall(function()
+    RSConnection = RunService.RenderStepped:Connect(function()
+        -- Update FOV circles
+        if DrawingsOK and Settings.ShowFOV then
+            FOVCircle.Visible = Settings.Aimbot
+            FOVCircle.Position = Vector2.new(Mouse.X, Mouse.Y + 36)
+            FOVCircle.Radius = Settings.AimbotFOV
+            FOVCircle.Thickness = 1.5
+            FOVCircle.Color = Color3.fromRGB(0, 255, 0)
+            FOVCircle.Transparency = 0.7
+            
+            SilentAimCircle.Visible = Settings.SilentAim
+            SilentAimCircle.Position = Vector2.new(Mouse.X, Mouse.Y + 36)
+            SilentAimCircle.Radius = Settings.SilentAimFOV
+            SilentAimCircle.Thickness = 1.5
+            SilentAimCircle.Color = Color3.fromRGB(255, 0, 0)
+            SilentAimCircle.Transparency = 0.5
+        elseif DrawingsOK then
+            FOVCircle.Visible = false
+            SilentAimCircle.Visible = false
+        end
+        
+        -- Aimbot
+        if Settings.Aimbot and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+            local target = GetClosestPlayer(Settings.AimbotFOV)
+            if target and target.Character then
+                local head = target.Character:FindFirstChild("Head")
+                local rootPart = target.Character:FindFirstChild("HumanoidRootPart")
+                local aimPart = head or rootPart
+                
+                if aimPart then
+                    local targetCFrame = CFrame.new(Camera.CFrame.Position, aimPart.Position)
+                    Camera.CFrame = Camera.CFrame:Lerp(targetCFrame, Settings.AimbotSmoothness)
+                end
+            end
+        end
+    end)
+end)
+
+-- Speed function
+local function UpdateSpeed()
+    local character = LocalPlayer.Character
+    if character then
+        local humanoid = character:FindFirstChild("Humanoid")
+        if humanoid then
+            humanoid.WalkSpeed = Settings.SpeedEnabled and Settings.SpeedValue or 16
+        end
+    end
+end
+
+-- Speed loop
+task.spawn(function()
+    while true do
+        if Settings.SpeedEnabled then
+            UpdateSpeed()
+        end
+        task.wait(0.1)
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    if Settings.SpeedEnabled then
+        UpdateSpeed()
+    end
+end)
+
+-- Cleanup
+game:GetService("CoreGui").ChildRemoved:Connect(function(child)
+    if child.Name == "Rayfield" then
+        if RSConnection then
+            RSConnection:Disconnect()
+        end
+        if DrawingsOK then
+            FOVCircle:Remove()
+            SilentAimCircle:Remove()
+        end
+    end
+end)
+
+print("Murder Duels Script Loaded | boyoftheboy")
