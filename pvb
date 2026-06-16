@@ -1,0 +1,1366 @@
+-- Coordinate + Camera Saver + Instant ProximityPrompt
+-- Features:
+-- Save default-named coords
+-- Rename coords directly in row
+-- TP hotkey per coord
+-- UPD/update hotkey per coord
+-- TP / UPD / DEL buttons
+-- Click hotkey box, press combo to bind it
+-- Drag reorder with ☰ handle
+-- Resizable translucent UI
+-- One selected countdown trigger coord
+-- 90-second countdown visible while minimized
+-- Safer file + backup loading
+
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+
+local unpackFn = table.unpack or unpack
+
+-- ===== Countdown Settings =====
+local COUNTDOWN_SECONDS = 90
+local countdownEndsAt = 0
+local countdownActiveName = nil
+local countdownLabel = nil
+
+local function formatCountdown(seconds)
+	seconds = math.max(0, math.ceil(seconds))
+	local m = math.floor(seconds / 60)
+	local s = seconds % 60
+	return string.format("%d:%02d", m, s)
+end
+
+local function updateCountdownLabel()
+	if not countdownLabel then return end
+
+	if countdownEndsAt <= 0 then
+		countdownLabel.Text = "⏱ --"
+		return
+	end
+
+	local remaining = countdownEndsAt - os.clock()
+
+	if remaining <= 0 then
+		countdownEndsAt = 0
+		countdownActiveName = nil
+		countdownLabel.Text = "⏱ 0:00"
+	else
+		countdownLabel.Text = "⏱ " .. formatCountdown(remaining)
+	end
+end
+
+-- ===== Instant ProximityPrompt =====
+local function makePromptInstant(obj)
+	if obj:IsA("ProximityPrompt") then
+		obj.HoldDuration = 0
+	end
+end
+
+for _, obj in ipairs(game:GetDescendants()) do
+	makePromptInstant(obj)
+end
+
+game.DescendantAdded:Connect(function(obj)
+	makePromptInstant(obj)
+end)
+
+-- ===== Files =====
+local FOLDER = ".Cordinat"
+local FILE = FOLDER .. "/kito.json"
+local BACKUP_FILE = FOLDER .. "/kito_backup.json"
+
+local canWrite = (type(writefile) == "function" and type(readfile) == "function")
+local canFS = (type(isfile) == "function" and type(isfolder) == "function" and type(makefolder) == "function")
+
+if canFS and not isfolder(FOLDER) then
+	pcall(makefolder, FOLDER)
+end
+
+local coordsCache = {}
+local tpHotkeyMap = {}
+local updHotkeyMap = {}
+local refreshList
+
+local function trim(s)
+	return tostring(s or ""):match("^%s*(.-)%s*$")
+end
+
+-- ===== Hotkey Helpers =====
+local numberNameToDisplay = {
+	Zero = "0",
+	One = "1",
+	Two = "2",
+	Three = "3",
+	Four = "4",
+	Five = "5",
+	Six = "6",
+	Seven = "7",
+	Eight = "8",
+	Nine = "9",
+}
+
+local displayToKeyName = {
+	["0"] = "Zero",
+	["1"] = "One",
+	["2"] = "Two",
+	["3"] = "Three",
+	["4"] = "Four",
+	["5"] = "Five",
+	["6"] = "Six",
+	["7"] = "Seven",
+	["8"] = "Eight",
+	["9"] = "Nine",
+}
+
+local modifierKeyNames = {
+	LeftControl = true,
+	RightControl = true,
+	LeftShift = true,
+	RightShift = true,
+	LeftAlt = true,
+	RightAlt = true,
+}
+
+local keyNamesByLower = {}
+local displayNamesByLower = {}
+
+local function displayFromKeyCodeName(name)
+	return numberNameToDisplay[name] or name
+end
+
+for _, item in ipairs(Enum.KeyCode:GetEnumItems()) do
+	local enumName = item.Name
+	keyNamesByLower[string.lower(enumName)] = enumName
+	displayNamesByLower[string.lower(displayFromKeyCodeName(enumName))] = enumName
+end
+
+local keyAliases = {
+	esc = "Escape",
+	escape = "Escape",
+	enter = "Return",
+	returnkey = "Return",
+	space = "Space",
+	spacebar = "Space",
+	del = "Delete",
+	delete = "Delete",
+	backspace = "Backspace",
+	tab = "Tab",
+	capslock = "CapsLock",
+}
+
+local function normalizeMainKey(part)
+	part = trim(part)
+	if part == "" then return nil end
+
+	local lower = string.lower(part)
+
+	if displayToKeyName[part] then
+		return displayFromKeyCodeName(displayToKeyName[part])
+	end
+
+	if keyAliases[lower] then
+		return displayFromKeyCodeName(keyAliases[lower])
+	end
+
+	if keyNamesByLower[lower] then
+		return displayFromKeyCodeName(keyNamesByLower[lower])
+	end
+
+	if displayNamesByLower[lower] then
+		return displayFromKeyCodeName(displayNamesByLower[lower])
+	end
+
+	return false
+end
+
+local function normalizeComboText(text)
+	text = trim(text)
+
+	if text == "" then
+		return nil
+	end
+
+	text = text:gsub("%s+", "")
+
+	local parts = {}
+	for part in string.gmatch(text, "[^+]+") do
+		table.insert(parts, part)
+	end
+
+	local ctrl = false
+	local alt = false
+	local shift = false
+	local mainKey = nil
+
+	for _, part in ipairs(parts) do
+		local lower = string.lower(part)
+
+		if lower == "ctrl" or lower == "control" or lower == "leftcontrol" or lower == "rightcontrol" then
+			ctrl = true
+		elseif lower == "alt" or lower == "leftalt" or lower == "rightalt" then
+			alt = true
+		elseif lower == "shift" or lower == "leftshift" or lower == "rightshift" then
+			shift = true
+		else
+			local key = normalizeMainKey(part)
+
+			if key == false then
+				warn("Invalid hotkey key:", part)
+				return false
+			end
+
+			if mainKey then
+				warn("Invalid combo, multiple main keys:", text)
+				return false
+			end
+
+			mainKey = key
+		end
+	end
+
+	if not mainKey then
+		return false
+	end
+
+	local combo = {}
+
+	if ctrl then table.insert(combo, "Ctrl") end
+	if alt then table.insert(combo, "Alt") end
+	if shift then table.insert(combo, "Shift") end
+
+	table.insert(combo, mainKey)
+
+	return table.concat(combo, "+")
+end
+
+local function isDown(key)
+	return UIS:IsKeyDown(Enum.KeyCode[key])
+end
+
+local function comboFromKeyCode(keyCode)
+	local keyName = keyCode.Name
+
+	if keyName == "Unknown" then
+		return nil
+	end
+
+	if modifierKeyNames[keyName] then
+		return nil
+	end
+
+	local combo = {}
+
+	if isDown("LeftControl") or isDown("RightControl") then
+		table.insert(combo, "Ctrl")
+	end
+
+	if isDown("LeftAlt") or isDown("RightAlt") then
+		table.insert(combo, "Alt")
+	end
+
+	if isDown("LeftShift") or isDown("RightShift") then
+		table.insert(combo, "Shift")
+	end
+
+	table.insert(combo, displayFromKeyCodeName(keyName))
+
+	return table.concat(combo, "+")
+end
+
+-- ===== File Load / Save =====
+local function normalizeCoords(tbl)
+	if type(tbl) ~= "table" then
+		return {}
+	end
+
+	for name, data in pairs(tbl) do
+		if type(data) ~= "table" then
+			tbl[name] = nil
+		else
+			if not data.pos and tonumber(data[1]) and tonumber(data[2]) and tonumber(data[3]) then
+				data = {
+					pos = {data[1], data[2], data[3]},
+					cam = data.cam,
+					tpHotkey = data.tpHotkey or data.hotkey,
+					updHotkey = data.updHotkey,
+					countdownTimer = data.countdownTimer == true,
+					order = data.order,
+				}
+
+				tbl[name] = data
+			end
+
+			if type(data.pos) ~= "table" then
+				tbl[name] = nil
+			else
+				if data.hotkey and not data.tpHotkey then
+					data.tpHotkey = data.hotkey
+				end
+
+				data.hotkey = nil
+				data.countdownTimer = data.countdownTimer == true
+
+				if data.tpHotkey then
+					local fixed = normalizeComboText(data.tpHotkey)
+					data.tpHotkey = fixed ~= false and fixed or nil
+				end
+
+				if data.updHotkey then
+					local fixed = normalizeComboText(data.updHotkey)
+					data.updHotkey = fixed ~= false and fixed or nil
+				end
+			end
+		end
+	end
+
+	return tbl
+end
+
+local function readJsonFile(path)
+	if not canWrite then
+		return nil
+	end
+
+	if canFS and not isfile(path) then
+		return nil
+	end
+
+	local ok, data = pcall(readfile, path)
+
+	if not ok or not data or #data == 0 then
+		return nil
+	end
+
+	local success, tbl = pcall(function()
+		return HttpService:JSONDecode(data)
+	end)
+
+	if success and type(tbl) == "table" then
+		return normalizeCoords(tbl)
+	end
+
+	return nil
+end
+
+local function loadCoords()
+	local tbl = readJsonFile(FILE)
+
+	if not tbl then
+		tbl = readJsonFile(BACKUP_FILE)
+	end
+
+	if tbl then
+		coordsCache = tbl
+	end
+
+	return coordsCache
+end
+
+local function saveCoords(tbl)
+	if type(tbl) ~= "table" then
+		return false
+	end
+
+	coordsCache = tbl
+
+	if not canWrite then
+		warn("writefile/readfile not supported. Coords are session-only.")
+		return false
+	end
+
+	if canFS and not isfolder(FOLDER) then
+		pcall(makefolder, FOLDER)
+	end
+
+	local ok, json = pcall(function()
+		return HttpService:JSONEncode(tbl)
+	end)
+
+	if not ok then
+		warn("Failed to encode coords.")
+		return false
+	end
+
+	local savedMain = pcall(writefile, FILE, json)
+	local savedBackup = pcall(writefile, BACKUP_FILE, json)
+
+	return savedMain or savedBackup
+end
+
+-- ===== Ordering =====
+local function getSortedKeys(coords)
+	local keys = {}
+
+	for name in pairs(coords) do
+		table.insert(keys, name)
+	end
+
+	table.sort(keys, function(a, b)
+		local da = coords[a]
+		local db = coords[b]
+		local oa = da and da.order
+		local ob = db and db.order
+
+		if type(oa) == "number" and type(ob) == "number" and oa ~= ob then
+			return oa < ob
+		end
+
+		if type(oa) == "number" and type(ob) ~= "number" then
+			return true
+		end
+
+		if type(oa) ~= "number" and type(ob) == "number" then
+			return false
+		end
+
+		return string.lower(a) < string.lower(b)
+	end)
+
+	return keys
+end
+
+local function applyOrders(coords, keys)
+	for i, name in ipairs(keys) do
+		if coords[name] then
+			coords[name].order = i
+		end
+	end
+end
+
+local function ensureOrders(coords)
+	local keys = getSortedKeys(coords)
+	local changed = false
+
+	for i, name in ipairs(keys) do
+		if coords[name] and coords[name].order ~= i then
+			coords[name].order = i
+			changed = true
+		end
+	end
+
+	return changed
+end
+
+-- ===== Countdown Trigger Helpers =====
+local function clearOtherCountdownTriggers(coords, selectedName)
+	for name, data in pairs(coords) do
+		if type(data) == "table" then
+			data.countdownTimer = (name == selectedName)
+		end
+	end
+end
+
+local function toggleCountdownTrigger(name)
+	local coords = loadCoords()
+	local data = coords[name]
+
+	if not data then
+		warn("Coord missing:", name)
+		return false
+	end
+
+	local currentlySelected = data.countdownTimer == true
+
+	for _, otherData in pairs(coords) do
+		if type(otherData) == "table" then
+			otherData.countdownTimer = false
+		end
+	end
+
+	if not currentlySelected then
+		data.countdownTimer = true
+		print("[⏱] Countdown trigger set:", name)
+	else
+		print("[⏱] Countdown trigger cleared:", name)
+	end
+
+	saveCoords(coords)
+	return true
+end
+
+local function startCountdownIfNeeded(name)
+	local coords = loadCoords()
+	local data = coords[name]
+
+	if data and data.countdownTimer == true then
+		countdownActiveName = name
+		countdownEndsAt = os.clock() + COUNTDOWN_SECONDS
+		updateCountdownLabel()
+		print("[⏱] Countdown started:", name)
+	end
+end
+
+-- ===== Hotkey Maps =====
+local function rebuildHotkeys()
+	tpHotkeyMap = {}
+	updHotkeyMap = {}
+
+	local coords = loadCoords()
+
+	for name, data in pairs(coords) do
+		if type(data) == "table" then
+			if data.tpHotkey and data.tpHotkey ~= "" then
+				tpHotkeyMap[data.tpHotkey] = name
+			end
+
+			if data.updHotkey and data.updHotkey ~= "" then
+				updHotkeyMap[data.updHotkey] = name
+			end
+		end
+	end
+end
+
+local function setCoordHotkey(name, field, hotkeyText)
+	local coords = loadCoords()
+	local data = coords[name]
+
+	if not data then
+		warn("Coord missing:", name)
+		return false
+	end
+
+	local combo = normalizeComboText(hotkeyText)
+
+	if combo == false then
+		return false
+	end
+
+	for _, otherData in pairs(coords) do
+		if type(otherData) == "table" then
+			if otherData.tpHotkey == combo then
+				otherData.tpHotkey = nil
+			end
+
+			if otherData.updHotkey == combo then
+				otherData.updHotkey = nil
+			end
+		end
+	end
+
+	data[field] = combo
+
+	saveCoords(coords)
+	rebuildHotkeys()
+
+	if combo then
+		print("[⌨] Set", field, "for", name, "=", combo)
+	else
+		print("[⌨] Cleared", field, "for", name)
+	end
+
+	return true
+end
+
+-- ===== Position / Camera =====
+local function getPos()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return nil end
+
+	return hrp.Position
+end
+
+local function getCam()
+	local cam = workspace.CurrentCamera
+	if not cam then return nil end
+	return cam.CFrame
+end
+
+local function makeDefaultName(coords)
+	local i = 1
+
+	while coords["Pos_" .. i] do
+		i = i + 1
+	end
+
+	return "Pos_" .. i
+end
+
+local function addCoord()
+	local pos = getPos()
+
+	if not pos then
+		warn("Character not found.")
+		return false
+	end
+
+	local coords = loadCoords()
+	ensureOrders(coords)
+
+	local camCF = getCam()
+	local name = makeDefaultName(coords)
+	local keys = getSortedKeys(coords)
+
+	coords[name] = {
+		pos = {pos.X, pos.Y, pos.Z},
+		cam = camCF and {camCF:GetComponents()} or nil,
+		tpHotkey = nil,
+		updHotkey = nil,
+		countdownTimer = false,
+		order = #keys + 1,
+	}
+
+	saveCoords(coords)
+	rebuildHotkeys()
+
+	print("[+] Saved:", name)
+
+	return true
+end
+
+local function updateCoord(name)
+	local coords = loadCoords()
+	local data = coords[name]
+
+	if not data then
+		warn("Coordinate not found:", name)
+		return false
+	end
+
+	local pos = getPos()
+
+	if not pos then
+		warn("Character not found.")
+		return false
+	end
+
+	local camCF = getCam()
+
+	data.pos = {pos.X, pos.Y, pos.Z}
+	data.cam = camCF and {camCF:GetComponents()} or nil
+
+	saveCoords(coords)
+	rebuildHotkeys()
+
+	print("[↻] Updated:", name)
+
+	return true
+end
+
+local function tpCoord(name)
+	local coords = loadCoords()
+	local data = coords[name]
+
+	if not data then
+		warn("Coordinate not found:", name)
+		return false
+	end
+
+	local char = LocalPlayer.Character
+	if not char then return false end
+
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false end
+
+	local posData = data.pos or data
+
+	if not posData then return false end
+
+	hrp.CFrame = CFrame.new(posData[1], posData[2], posData[3])
+
+	if data.cam then
+		local cam = workspace.CurrentCamera
+
+		if cam then
+			cam.CameraType = Enum.CameraType.Scriptable
+			cam.CFrame = CFrame.new(unpackFn(data.cam))
+			task.wait(0.25)
+			cam.CameraType = Enum.CameraType.Custom
+		end
+	end
+
+	print("[✔] Teleported to:", name)
+
+	startCountdownIfNeeded(name)
+
+	return true
+end
+
+local function delCoord(name)
+	local coords = loadCoords()
+
+	if coords[name] then
+		coords[name] = nil
+
+		local keys = getSortedKeys(coords)
+		applyOrders(coords, keys)
+
+		saveCoords(coords)
+		rebuildHotkeys()
+
+		print("[-] Deleted:", name)
+
+		return true
+	end
+
+	warn("Name not found:", name)
+
+	return false
+end
+
+local function renameCoord(oldName, newName)
+	newName = trim(newName)
+
+	if newName == "" then
+		warn("Name cannot be blank.")
+		return false
+	end
+
+	if newName == oldName then
+		return true
+	end
+
+	local coords = loadCoords()
+
+	if coords[newName] then
+		warn("Name already exists:", newName)
+		return false
+	end
+
+	if not coords[oldName] then
+		warn("Old coord missing:", oldName)
+		return false
+	end
+
+	coords[newName] = coords[oldName]
+	coords[oldName] = nil
+
+	saveCoords(coords)
+	rebuildHotkeys()
+
+	print("[~] Renamed:", oldName, "->", newName)
+
+	return true
+end
+
+local function listCoords()
+	local coords = loadCoords()
+	local keys = getSortedKeys(coords)
+
+	for _, name in ipairs(keys) do
+		local data = coords[name]
+		local p = data.pos or data
+		local tp = data.tpHotkey and (" TP[" .. data.tpHotkey .. "]") or ""
+		local upd = data.updHotkey and (" UPD[" .. data.updHotkey .. "]") or ""
+		local timer = data.countdownTimer and " ⏱" or ""
+
+		print(string.format("%s%s%s%s -> (%.2f, %.2f, %.2f)", name, tp, upd, timer, p[1], p[2], p[3]))
+	end
+
+	if next(coords) == nil then
+		print("(empty)")
+	end
+end
+
+-- ===== GUI Parent =====
+local GUI_NAME = "CoordsSaverUI"
+
+pcall(function()
+	local old = CoreGui:FindFirstChild(GUI_NAME)
+	if old then
+		old:Destroy()
+	end
+end)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = GUI_NAME
+gui.ResetOnSpawn = false
+
+local parented = false
+
+if type(gethui) == "function" then
+	parented = pcall(function()
+		gui.Parent = gethui()
+	end)
+end
+
+if not parented then
+	parented = pcall(function()
+		gui.Parent = CoreGui
+	end)
+end
+
+if not parented then
+	gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- ===== UI =====
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 390, 0, 250)
+frame.Position = UDim2.new(0, 20, 0, 60)
+frame.BackgroundColor3 = Color3.fromRGB(22, 22, 22)
+frame.BackgroundTransparency = 0.18
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke", frame)
+stroke.Thickness = 1
+stroke.Color = Color3.fromRGB(90, 90, 90)
+stroke.Transparency = 0.35
+
+local saveBtn = Instance.new("TextButton", frame)
+saveBtn.Text = "Save"
+saveBtn.Size = UDim2.new(0, 58, 0, 24)
+saveBtn.Position = UDim2.new(0, 6, 0, 6)
+saveBtn.BackgroundColor3 = Color3.fromRGB(0, 160, 95)
+saveBtn.BackgroundTransparency = 0.05
+saveBtn.TextColor3 = Color3.new(1,1,1)
+saveBtn.BorderSizePixel = 0
+saveBtn.Font = Enum.Font.Gotham
+saveBtn.TextSize = 13
+Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 6)
+
+local refreshBtn = Instance.new("TextButton", frame)
+refreshBtn.Text = "Refresh"
+refreshBtn.Size = UDim2.new(0, 70, 0, 24)
+refreshBtn.Position = UDim2.new(0, 70, 0, 6)
+refreshBtn.BackgroundColor3 = Color3.fromRGB(60, 130, 255)
+refreshBtn.BackgroundTransparency = 0.05
+refreshBtn.TextColor3 = Color3.new(1,1,1)
+refreshBtn.BorderSizePixel = 0
+refreshBtn.Font = Enum.Font.Gotham
+refreshBtn.TextSize = 13
+Instance.new("UICorner", refreshBtn).CornerRadius = UDim.new(0, 6)
+
+countdownLabel = Instance.new("TextLabel", frame)
+countdownLabel.Size = UDim2.new(0, 72, 0, 24)
+countdownLabel.Position = UDim2.new(0, 146, 0, 6)
+countdownLabel.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+countdownLabel.BackgroundTransparency = 0.12
+countdownLabel.TextColor3 = Color3.new(1,1,1)
+countdownLabel.BorderSizePixel = 0
+countdownLabel.Font = Enum.Font.GothamBold
+countdownLabel.TextSize = 13
+countdownLabel.Text = "⏱ --"
+Instance.new("UICorner", countdownLabel).CornerRadius = UDim.new(0, 6)
+
+local minBtn = Instance.new("TextButton", frame)
+minBtn.Size = UDim2.new(0, 30, 0, 24)
+minBtn.Position = UDim2.new(1, -70, 0, 6)
+minBtn.Text = "-"
+minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+minBtn.BackgroundTransparency = 0.05
+minBtn.TextColor3 = Color3.new(1,1,1)
+minBtn.BorderSizePixel = 0
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 16
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+local closeBtn = Instance.new("TextButton", frame)
+closeBtn.Size = UDim2.new(0, 30, 0, 24)
+closeBtn.Position = UDim2.new(1, -36, 0, 6)
+closeBtn.Text = "X"
+closeBtn.BackgroundColor3 = Color3.fromRGB(120, 50, 50)
+closeBtn.BackgroundTransparency = 0.05
+closeBtn.TextColor3 = Color3.new(1,1,1)
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 14
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+local listFrame = Instance.new("ScrollingFrame", frame)
+listFrame.Size = UDim2.new(1, -12, 1, -46)
+listFrame.Position = UDim2.new(0, 6, 0, 38)
+listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+listFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+listFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+listFrame.BackgroundTransparency = 0.18
+listFrame.BorderSizePixel = 0
+listFrame.ScrollBarThickness = 6
+listFrame.Parent = frame
+Instance.new("UICorner", listFrame).CornerRadius = UDim.new(0, 8)
+
+local layout = Instance.new("UIListLayout", listFrame)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 4)
+
+local resizeHandle = Instance.new("TextButton", frame)
+resizeHandle.Size = UDim2.new(0, 16, 0, 16)
+resizeHandle.Position = UDim2.new(1, -18, 1, -18)
+resizeHandle.Text = "◢"
+resizeHandle.BackgroundTransparency = 1
+resizeHandle.TextColor3 = Color3.fromRGB(180, 180, 180)
+resizeHandle.Font = Enum.Font.GothamBold
+resizeHandle.TextSize = 14
+resizeHandle.Parent = frame
+
+-- ===== Minimize / Close =====
+local minimized = false
+local oldSize = frame.Size
+
+closeBtn.MouseButton1Click:Connect(function()
+	gui:Destroy()
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+
+	if minimized then
+		oldSize = frame.Size
+		frame.Size = UDim2.new(0, 170, 0, 36)
+
+		saveBtn.Visible = false
+		refreshBtn.Visible = false
+		listFrame.Visible = false
+		resizeHandle.Visible = false
+
+		countdownLabel.Visible = true
+		countdownLabel.Position = UDim2.new(0, 6, 0, 6)
+		countdownLabel.Size = UDim2.new(0, 72, 0, 24)
+
+		minBtn.Position = UDim2.new(1, -70, 0, 6)
+		closeBtn.Position = UDim2.new(1, -36, 0, 6)
+	else
+		frame.Size = oldSize
+
+		saveBtn.Visible = true
+		refreshBtn.Visible = true
+		listFrame.Visible = true
+		resizeHandle.Visible = true
+
+		countdownLabel.Visible = true
+		countdownLabel.Position = UDim2.new(0, 146, 0, 6)
+		countdownLabel.Size = UDim2.new(0, 72, 0, 24)
+
+		minBtn.Position = UDim2.new(1, -70, 0, 6)
+		closeBtn.Position = UDim2.new(1, -36, 0, 6)
+	end
+end)
+
+-- ===== Resize Logic =====
+local resizing = false
+local resizeStartMouse
+local resizeStartSize
+
+resizeHandle.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		resizing = true
+		resizeStartMouse = UIS:GetMouseLocation()
+		resizeStartSize = frame.AbsoluteSize
+	end
+end)
+
+UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		resizing = false
+	end
+end)
+
+UIS.InputChanged:Connect(function(input)
+	if resizing and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local mouse = UIS:GetMouseLocation()
+		local delta = mouse - resizeStartMouse
+
+		local newW = math.clamp(resizeStartSize.X + delta.X, 390, 700)
+		local newH = math.clamp(resizeStartSize.Y + delta.Y, 140, 700)
+
+		frame.Size = UDim2.new(0, newW, 0, newH)
+	end
+end)
+
+-- ===== Drag Reorder Logic =====
+local draggingName = nil
+local ROW_HEIGHT = 34
+local ROW_PAD = 4
+
+local function moveCoordToIndex(coordName, targetIndex)
+	local coords = loadCoords()
+	local keys = getSortedKeys(coords)
+
+	local currentIndex = table.find(keys, coordName)
+
+	if not currentIndex then return end
+
+	targetIndex = math.clamp(targetIndex, 1, #keys)
+
+	if currentIndex == targetIndex then
+		return
+	end
+
+	table.remove(keys, currentIndex)
+	table.insert(keys, targetIndex, coordName)
+
+	applyOrders(coords, keys)
+	saveCoords(coords)
+end
+
+-- ===== Hotkey Box Recording =====
+local activeHotkeyBox = nil
+
+local function connectHotkeyBox(box, name, field, oldValue)
+	box.Focused:Connect(function()
+		activeHotkeyBox = box
+		box.PlaceholderText = "press"
+	end)
+
+	box.FocusLost:Connect(function()
+		if activeHotkeyBox == box then
+			activeHotkeyBox = nil
+		end
+
+		local ok = setCoordHotkey(name, field, box.Text)
+
+		if ok then
+			if refreshList then
+				task.defer(refreshList)
+			end
+		else
+			box.Text = oldValue or ""
+		end
+	end)
+end
+
+UIS.InputBegan:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	local focusedBox = UIS:GetFocusedTextBox()
+
+	if activeHotkeyBox and focusedBox == activeHotkeyBox then
+		if input.KeyCode == Enum.KeyCode.Backspace or input.KeyCode == Enum.KeyCode.Delete then
+			activeHotkeyBox.Text = ""
+			activeHotkeyBox:ReleaseFocus()
+			return
+		end
+
+		if input.KeyCode == Enum.KeyCode.Escape then
+			activeHotkeyBox:ReleaseFocus()
+			return
+		end
+
+		local combo = comboFromKeyCode(input.KeyCode)
+
+		if combo then
+			activeHotkeyBox.Text = combo
+			activeHotkeyBox:ReleaseFocus()
+		end
+
+		return
+	end
+
+	if focusedBox then
+		return
+	end
+
+	local combo = comboFromKeyCode(input.KeyCode)
+
+	if not combo then
+		return
+	end
+
+	local updName = updHotkeyMap[combo]
+
+	if updName then
+		if updateCoord(updName) and refreshList then
+			refreshList()
+		end
+
+		return
+	end
+
+	local tpName = tpHotkeyMap[combo]
+
+	if tpName then
+		tpCoord(tpName)
+	end
+end)
+
+-- ===== Refresh List =====
+refreshList = function()
+	local coords = loadCoords()
+	local changed = ensureOrders(coords)
+
+	if changed then
+		saveCoords(coords)
+	end
+
+	for _, v in pairs(listFrame:GetChildren()) do
+		if v:IsA("Frame") then
+			v:Destroy()
+		end
+	end
+
+	local keys = getSortedKeys(coords)
+
+	for i, name in ipairs(keys) do
+		local data = coords[name]
+
+		local item = Instance.new("Frame", listFrame)
+		item.Size = UDim2.new(1, -8, 0, ROW_HEIGHT)
+		item.BackgroundColor3 = Color3.fromRGB(42, 42, 42)
+		item.BackgroundTransparency = 0.08
+		item.BorderSizePixel = 0
+		item.LayoutOrder = data.order or i
+		Instance.new("UICorner", item).CornerRadius = UDim.new(0, 7)
+
+		local dragBtn = Instance.new("TextButton", item)
+		dragBtn.Size = UDim2.new(0, 22, 1, -6)
+		dragBtn.Position = UDim2.new(0, 3, 0, 3)
+		dragBtn.Text = "☰"
+		dragBtn.Font = Enum.Font.GothamBold
+		dragBtn.TextSize = 14
+		dragBtn.TextColor3 = Color3.fromRGB(210, 210, 210)
+		dragBtn.BackgroundColor3 = Color3.fromRGB(65, 65, 65)
+		dragBtn.BorderSizePixel = 0
+		Instance.new("UICorner", dragBtn).CornerRadius = UDim.new(0, 5)
+
+		local nameBox = Instance.new("TextBox", item)
+		nameBox.Size = UDim2.new(0, 80, 1, -6)
+		nameBox.Position = UDim2.new(0, 30, 0, 3)
+		nameBox.Text = name
+		nameBox.ClearTextOnFocus = false
+		nameBox.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+		nameBox.TextColor3 = Color3.new(1,1,1)
+		nameBox.BorderSizePixel = 0
+		nameBox.Font = Enum.Font.Gotham
+		nameBox.TextSize = 12
+		Instance.new("UICorner", nameBox).CornerRadius = UDim.new(0, 5)
+
+		local tpKeyBox = Instance.new("TextBox", item)
+		tpKeyBox.Size = UDim2.new(0, 55, 1, -6)
+		tpKeyBox.Position = UDim2.new(0, 114, 0, 3)
+		tpKeyBox.PlaceholderText = "TP key"
+		tpKeyBox.Text = data.tpHotkey or ""
+		tpKeyBox.ClearTextOnFocus = false
+		tpKeyBox.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+		tpKeyBox.TextColor3 = Color3.new(1,1,1)
+		tpKeyBox.BorderSizePixel = 0
+		tpKeyBox.Font = Enum.Font.Gotham
+		tpKeyBox.TextSize = 11
+		Instance.new("UICorner", tpKeyBox).CornerRadius = UDim.new(0, 5)
+
+		local updKeyBox = Instance.new("TextBox", item)
+		updKeyBox.Size = UDim2.new(0, 60, 1, -6)
+		updKeyBox.Position = UDim2.new(0, 173, 0, 3)
+		updKeyBox.PlaceholderText = "UPD key"
+		updKeyBox.Text = data.updHotkey or ""
+		updKeyBox.ClearTextOnFocus = false
+		updKeyBox.BackgroundColor3 = Color3.fromRGB(55, 55, 55)
+		updKeyBox.TextColor3 = Color3.new(1,1,1)
+		updKeyBox.BorderSizePixel = 0
+		updKeyBox.Font = Enum.Font.Gotham
+		updKeyBox.TextSize = 11
+		Instance.new("UICorner", updKeyBox).CornerRadius = UDim.new(0, 5)
+
+		local timerBtn = Instance.new("TextButton", item)
+		timerBtn.Size = UDim2.new(0, 24, 1, -6)
+		timerBtn.Position = UDim2.new(0, 237, 0, 3)
+		timerBtn.Text = data.countdownTimer and "⏱" or "○"
+		timerBtn.Font = Enum.Font.GothamBold
+		timerBtn.TextColor3 = Color3.new(1,1,1)
+		timerBtn.TextSize = 12
+		timerBtn.BackgroundColor3 = data.countdownTimer and Color3.fromRGB(180, 140, 40) or Color3.fromRGB(70,70,70)
+		timerBtn.BorderSizePixel = 0
+		Instance.new("UICorner", timerBtn).CornerRadius = UDim.new(0, 5)
+
+		local tpBtn = Instance.new("TextButton", item)
+		tpBtn.Size = UDim2.new(0, 32, 1, -6)
+		tpBtn.Position = UDim2.new(1, -118, 0, 3)
+		tpBtn.Text = "TP"
+		tpBtn.Font = Enum.Font.Gotham
+		tpBtn.TextColor3 = Color3.new(1,1,1)
+		tpBtn.TextSize = 12
+		tpBtn.BackgroundColor3 = Color3.fromRGB(80,80,80)
+		tpBtn.BorderSizePixel = 0
+		Instance.new("UICorner", tpBtn).CornerRadius = UDim.new(0, 5)
+
+		local updBtn = Instance.new("TextButton", item)
+		updBtn.Size = UDim2.new(0, 40, 1, -6)
+		updBtn.Position = UDim2.new(1, -82, 0, 3)
+		updBtn.Text = "UPD"
+		updBtn.Font = Enum.Font.Gotham
+		updBtn.TextColor3 = Color3.new(1,1,1)
+		updBtn.TextSize = 12
+		updBtn.BackgroundColor3 = Color3.fromRGB(180, 120, 45)
+		updBtn.BorderSizePixel = 0
+		Instance.new("UICorner", updBtn).CornerRadius = UDim.new(0, 5)
+
+		local delBtn = Instance.new("TextButton", item)
+		delBtn.Size = UDim2.new(0, 36, 1, -6)
+		delBtn.Position = UDim2.new(1, -39, 0, 3)
+		delBtn.Text = "DEL"
+		delBtn.Font = Enum.Font.Gotham
+		delBtn.TextColor3 = Color3.new(1,1,1)
+		delBtn.TextSize = 12
+		delBtn.BackgroundColor3 = Color3.fromRGB(120,50,50)
+		delBtn.BorderSizePixel = 0
+		Instance.new("UICorner", delBtn).CornerRadius = UDim.new(0, 5)
+
+		dragBtn.InputBegan:Connect(function(inputObj)
+			if inputObj.UserInputType == Enum.UserInputType.MouseButton1 then
+				draggingName = name
+				dragBtn.Text = "↕"
+			end
+		end)
+
+		nameBox.FocusLost:Connect(function()
+			local newName = trim(nameBox.Text)
+
+			if newName ~= name then
+				local ok = renameCoord(name, newName)
+
+				if ok then
+					refreshList()
+				else
+					nameBox.Text = name
+				end
+			end
+		end)
+
+		connectHotkeyBox(tpKeyBox, name, "tpHotkey", data.tpHotkey)
+		connectHotkeyBox(updKeyBox, name, "updHotkey", data.updHotkey)
+
+		timerBtn.MouseButton1Click:Connect(function()
+			if toggleCountdownTrigger(name) then
+				refreshList()
+			end
+		end)
+
+		tpBtn.MouseButton1Click:Connect(function()
+			tpCoord(name)
+		end)
+
+		updBtn.MouseButton1Click:Connect(function()
+			if updateCoord(name) then
+				refreshList()
+			end
+		end)
+
+		delBtn.MouseButton1Click:Connect(function()
+			if delCoord(name) then
+				refreshList()
+			end
+		end)
+	end
+end
+
+UIS.InputChanged:Connect(function(input)
+	if draggingName and input.UserInputType == Enum.UserInputType.MouseMovement then
+		local mouseY = UIS:GetMouseLocation().Y
+		local relativeY = mouseY - listFrame.AbsolutePosition.Y + listFrame.CanvasPosition.Y
+		local targetIndex = math.floor(relativeY / (ROW_HEIGHT + ROW_PAD)) + 1
+
+		moveCoordToIndex(draggingName, targetIndex)
+		refreshList()
+	end
+end)
+
+UIS.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		draggingName = nil
+	end
+end)
+
+saveBtn.MouseButton1Click:Connect(function()
+	if addCoord() then
+		refreshList()
+	end
+end)
+
+refreshBtn.MouseButton1Click:Connect(function()
+	rebuildHotkeys()
+	refreshList()
+end)
+
+-- ===== Countdown Update Loop =====
+task.spawn(function()
+	while gui and gui.Parent do
+		updateCountdownLabel()
+		task.wait(0.2)
+	end
+end)
+
+-- ===== Start =====
+loadCoords()
+rebuildHotkeys()
+refreshList()
+updateCountdownLabel()
+
+getgenv().Coords = {
+	add = function()
+		if addCoord() then
+			refreshList()
+		end
+	end,
+
+	tp = tpCoord,
+
+	update = function(name)
+		if updateCoord(name) then
+			refreshList()
+		end
+	end,
+
+	remove = function(name)
+		if delCoord(name) then
+			refreshList()
+		end
+	end,
+
+	rename = function(oldName, newName)
+		if renameCoord(oldName, newName) then
+			refreshList()
+		end
+	end,
+
+	tpHotkey = function(name, key)
+		if setCoordHotkey(name, "tpHotkey", key) then
+			refreshList()
+		end
+	end,
+
+	updateHotkey = function(name, key)
+		if setCoordHotkey(name, "updHotkey", key) then
+			refreshList()
+		end
+	end,
+
+	timer = function(name)
+		if toggleCountdownTrigger(name) then
+			refreshList()
+		end
+	end,
+
+	list = listCoords,
+
+	refresh = function()
+		rebuildHotkeys()
+		refreshList()
+	end,
+
+	instantPrompts = function()
+		for _, obj in ipairs(game:GetDescendants()) do
+			makePromptInstant(obj)
+		end
+
+		print("✅ Re-applied instant prompts")
+	end
+}
+
+print("✅ Coordinate + Camera Saver active")
+print("✅ Instant ProximityPrompt active")
+print("Click TP key / UPD key box, then press a key combo to bind it.")
+print("Click ○/⏱ next to a row to make that row trigger the 90s countdown.")
+print("Only one countdown trigger can be selected at a time.")
+print("Avoid Alt+F4 because Windows may close Roblox.")
+print("Commands:")
+print("Coords.add()")
+print("Coords.tp('Pos_1')")
+print("Coords.update('Pos_1')")
+print("Coords.rename('Pos_1', 'Shop')")
+print("Coords.tpHotkey('Shop', 'F6')")
+print("Coords.updateHotkey('Shop', 'Ctrl+F6')")
+print("Coords.timer('Shop')")
+print("Coords.remove('Shop')")
+print("Coords.list()")
+print("Coords.refresh()")
