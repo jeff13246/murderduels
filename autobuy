@@ -1,0 +1,146 @@
+--==============================================================
+--  PvB Auto-Buy (seeds / gear)
+--  - reads each item's live Stock attribute
+--  - buys anything in stock (seeds via BuyItem, gear via BuyGear)
+--  - event driven: wakes on restock, buys, sleeps again
+--==============================================================
+
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local plr     = Players.LocalPlayer
+
+local Remotes = RS:WaitForChild("Remotes")
+local BuyItem = Remotes.BuyItem
+local BuyGear = Remotes.BuyGear
+local SEEDS   = RS.Assets:WaitForChild("Seeds")
+local GEARS   = RS.Assets:WaitForChild("Gears")
+
+--------------------------------------------------------------------
+-- config (edited live by the panel)
+--------------------------------------------------------------------
+local cfg = {
+    enabled  = true,
+    buySeeds = true,
+    buyGears = true,
+    buyDelay = 0.45,   -- gap between individual buys (shop cooldown)
+}
+
+--------------------------------------------------------------------
+-- panel
+--------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "PvBAutoBuy"
+gui.ResetOnSpawn = false
+gui.Parent = plr:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(230, 170)
+frame.Position = UDim2.fromOffset(24, 410)
+frame.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+do
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0,8); c.Parent = frame
+    local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(60,60,72); s.Thickness = 1; s.Parent = frame
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0,10); pad.PaddingBottom = UDim.new(0,10)
+    pad.PaddingLeft = UDim.new(0,12); pad.PaddingRight = UDim.new(0,12); pad.Parent = frame
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0,8); list.SortOrder = Enum.SortOrder.LayoutOrder; list.Parent = frame
+end
+
+local order = 0
+local function nextOrder() order = order + 1; return order end
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1,0,0,20); title.BackgroundTransparency = 1
+title.Text = "PvB Auto-Buy"; title.TextColor3 = Color3.fromRGB(235,235,245)
+title.Font = Enum.Font.GothamBold; title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left; title.LayoutOrder = nextOrder(); title.Parent = frame
+
+local function makeToggle(text, getv, setv)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1,0,0,26); btn.BackgroundColor3 = Color3.fromRGB(34,34,42)
+    btn.Text = ""; btn.LayoutOrder = nextOrder(); btn.Parent = frame
+    local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0,6); cc.Parent = btn
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1,-44,1,0); lbl.Position = UDim2.fromOffset(8,0)
+    lbl.BackgroundTransparency = 1; lbl.Text = text; lbl.TextColor3 = Color3.fromRGB(210,210,220)
+    lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13; lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = btn
+    local pip = Instance.new("TextLabel")
+    pip.Size = UDim2.fromOffset(34,18); pip.Position = UDim2.new(1,-40,0.5,-9)
+    pip.Font = Enum.Font.GothamBold; pip.TextSize = 11; pip.Parent = btn
+    local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0,5); pc.Parent = pip
+    local function refresh()
+        local on = getv()
+        pip.Text = on and "ON" or "OFF"
+        pip.BackgroundColor3 = on and Color3.fromRGB(60,170,90) or Color3.fromRGB(80,80,90)
+        pip.TextColor3 = Color3.fromRGB(255,255,255)
+    end
+    btn.MouseButton1Click:Connect(function() setv(not getv()); refresh() end)
+    refresh()
+end
+
+makeToggle("Enabled",   function() return cfg.enabled end,  function(v) cfg.enabled = v end)
+makeToggle("Buy seeds", function() return cfg.buySeeds end, function(v) cfg.buySeeds = v end)
+makeToggle("Buy gear",  function() return cfg.buyGears end, function(v) cfg.buyGears = v end)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1,0,0,26); status.BackgroundTransparency = 1
+status.Text = "idle"; status.TextColor3 = Color3.fromRGB(150,150,165)
+status.Font = Enum.Font.Gotham; status.TextSize = 12; status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left; status.LayoutOrder = nextOrder(); status.Parent = frame
+local function setStatus(t) status.Text = t end
+
+--------------------------------------------------------------------
+-- buy logic
+--------------------------------------------------------------------
+local busy = false
+
+local function buyFolder(folder, remote)
+    local boughtSomething = false
+    for _, item in ipairs(folder:GetChildren()) do
+        if not cfg.enabled then return boughtSomething end
+        if (item:GetAttribute("Stock") or 0) > 0 then
+            remote:FireServer(item.Name, false)
+            setStatus("buying " .. item.Name)
+            boughtSomething = true
+            task.wait(cfg.buyDelay)
+        end
+    end
+    return boughtSomething
+end
+
+local function runPass()
+    if busy or not cfg.enabled then return end
+    busy = true
+    local again = true
+    while again and cfg.enabled do
+        again = false
+        if cfg.buySeeds and buyFolder(SEEDS, BuyItem) then again = true end
+        if cfg.buyGears and buyFolder(GEARS, BuyGear) then again = true end
+    end
+    busy = false
+    setStatus("waiting for restock")
+end
+
+-- wake up whenever the shop restocks
+for _, name in ipairs({"UpdatePlantStocks","UpdStock","SetSeedStock","UpdateGearStocks","UpdGearStock","Restock"}) do
+    local r = Remotes:FindFirstChild(name)
+    if r and r:IsA("RemoteEvent") then
+        r.OnClientEvent:Connect(function() task.spawn(runPass) end)
+    end
+end
+
+-- light backstop in case an event is missed
+task.spawn(function()
+    while true do
+        task.wait(2.5)
+        runPass()
+    end
+end)
+
+runPass()
+print("PvB Auto-Buy loaded")
