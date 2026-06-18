@@ -557,14 +557,19 @@ local function deleteCards(setStatus)
 
 			if totalFires == 0 then setStatus("Nothing to delete - already clean.") return end
 
+            local queue = {}
+			for _, p in ipairs(plan) do
+				for _ = 1, p.fires do queue[#queue + 1] = p.uuid end
+			end
+			local BATCH = 25            -- uuids per call; drop to 10 if the server ignores big ones
 			local done = 0
-			for _,p in ipairs(plan) do
-				for _=1,p.fires do
-					DeleteCards:FireServer({ p.uuid })
-					done = done + 1
-					if done % 4 == 0 then setStatus(("Deleting %d/%d"):format(done,totalFires)) end
-					task.wait(0.16)
-				end
+			for i = 1, #queue, BATCH do
+				local chunk = {}
+				for j = i, math.min(i + BATCH - 1, #queue) do chunk[#chunk + 1] = queue[j] end
+				DeleteCards:FireServer(chunk)
+				done = done + #chunk
+				setStatus(("Deleting %d/%d"):format(done, totalFires))
+				task.wait(0.12)
 			end
 			setStatus(("Done - deleted %d cards. Refresh to verify."):format(totalFires))
 			print("[DeleteCards] deleted", totalFires)
