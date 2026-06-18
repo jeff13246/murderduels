@@ -1,0 +1,231 @@
+--==============================================================
+--  PvB Auto-Keep + Auto-Heart
+--  - keeps brainrots off the lane by flipping the AutoSell filter
+--  - hearts the kept ones in your bag (matched by name + exact size)
+--  - thresholds editable in the little panel (values are in kg)
+--==============================================================
+
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local plr     = Players.LocalPlayer
+
+local AutoSell     = RS.Remotes.AutoSell
+local FavoriteItem = RS.Remotes.FavoriteItem
+local LANE         = workspace:WaitForChild("ScriptedMap"):WaitForChild("MissionBrainrots")
+local BP           = plr:WaitForChild("Backpack")
+
+--------------------------------------------------------------------
+-- config (these get edited live by the panel; kg, not size)
+--------------------------------------------------------------------
+local cfg = {
+    enabled       = true,
+    keepForbidden = true,
+    keepSecretKg  = 200,   -- keep any secret over this weight
+    keepAnyKg     = 300,   -- keep anything at all over this weight
+    doHeart       = true,
+}
+
+local function kgToSize(kg) return kg / 10 end   -- weight = size * 10
+
+--------------------------------------------------------------------
+-- small UI
+--------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "PvBAutoKeep"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = plr:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(250, 250)
+frame.Position = UDim2.fromOffset(24, 140)
+frame.BackgroundColor3 = Color3.fromRGB(22, 22, 28)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+do
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = frame
+    local s = Instance.new("UIStroke"); s.Color = Color3.fromRGB(60,60,72); s.Thickness = 1; s.Parent = frame
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop = UDim.new(0,10); pad.PaddingBottom = UDim.new(0,10)
+    pad.PaddingLeft = UDim.new(0,12); pad.PaddingRight = UDim.new(0,12)
+    pad.Parent = frame
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0,8); list.SortOrder = Enum.SortOrder.LayoutOrder; list.Parent = frame
+end
+
+local order = 0
+local function nextOrder() order = order + 1; return order end
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1,0,0,20)
+title.BackgroundTransparency = 1
+title.Text = "PvB Auto-Keep"
+title.TextColor3 = Color3.fromRGB(235,235,245)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.LayoutOrder = nextOrder()
+title.Parent = frame
+
+-- toggle row builder
+local function makeToggle(text, getv, setv)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1,0,0,26)
+    btn.BackgroundColor3 = Color3.fromRGB(34,34,42)
+    btn.AutoButtonColor = true
+    btn.Text = ""
+    btn.LayoutOrder = nextOrder()
+    btn.Parent = frame
+    local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0,6); cc.Parent = btn
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1,-44,1,0); lbl.Position = UDim2.fromOffset(8,0)
+    lbl.BackgroundTransparency = 1; lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(210,210,220); lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = btn
+    local pip = Instance.new("TextLabel")
+    pip.Size = UDim2.fromOffset(34,18); pip.Position = UDim2.new(1,-40,0.5,-9)
+    pip.Font = Enum.Font.GothamBold; pip.TextSize = 11; pip.Parent = btn
+    local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0,5); pc.Parent = pip
+    local function refresh()
+        local on = getv()
+        pip.Text = on and "ON" or "OFF"
+        pip.BackgroundColor3 = on and Color3.fromRGB(60,170,90) or Color3.fromRGB(80,80,90)
+        pip.TextColor3 = Color3.fromRGB(255,255,255)
+    end
+    btn.MouseButton1Click:Connect(function() setv(not getv()); refresh() end)
+    refresh()
+    return btn
+end
+
+-- number input builder
+local function makeInput(text, getv, setv)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1,0,0,26); row.BackgroundTransparency = 1
+    row.LayoutOrder = nextOrder(); row.Parent = frame
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1,-70,1,0); lbl.BackgroundTransparency = 1; lbl.Text = text
+    lbl.TextColor3 = Color3.fromRGB(210,210,220); lbl.Font = Enum.Font.Gotham; lbl.TextSize = 13
+    lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Parent = row
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.fromOffset(62,24); box.Position = UDim2.new(1,-62,0.5,-12)
+    box.BackgroundColor3 = Color3.fromRGB(34,34,42)
+    box.TextColor3 = Color3.fromRGB(240,240,250); box.Font = Enum.Font.GothamMedium; box.TextSize = 13
+    box.Text = tostring(getv()); box.ClearTextOnFocus = false; box.Parent = row
+    local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0,6); bc.Parent = box
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then setv(n) else box.Text = tostring(getv()) end
+    end)
+end
+
+makeToggle("Enabled", function() return cfg.enabled end, function(v) cfg.enabled = v end)
+makeToggle("Keep all Forbidden", function() return cfg.keepForbidden end, function(v) cfg.keepForbidden = v end)
+makeInput("Keep secrets over (kg)", function() return cfg.keepSecretKg end, function(v) cfg.keepSecretKg = v end)
+makeInput("Keep anything over (kg)", function() return cfg.keepAnyKg end, function(v) cfg.keepAnyKg = v end)
+makeToggle("Auto-heart kept ones", function() return cfg.doHeart end, function(v) cfg.doHeart = v end)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1,0,0,30)
+status.BackgroundTransparency = 1
+status.Text = "idle"
+status.TextColor3 = Color3.fromRGB(150,150,165)
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.LayoutOrder = nextOrder()
+status.Parent = frame
+
+local function setStatus(t) status.Text = t end
+
+--------------------------------------------------------------------
+-- keep logic
+--------------------------------------------------------------------
+local function shouldKeep(rarity, size)
+    if not cfg.enabled then return false end
+    if cfg.keepForbidden and rarity == "Forbidden" then return true end
+    if rarity == "Secret" and size and size > kgToSize(cfg.keepSecretKg) then return true end
+    if size and size > kgToSize(cfg.keepAnyKg) then return true end
+    return false
+end
+
+local filterOn, count = {}, {}
+local function setFilter(rarity, want)
+    if (filterOn[rarity] or false) ~= want then
+        AutoSell:FireServer(rarity)
+        filterOn[rarity] = want
+    end
+end
+
+--------------------------------------------------------------------
+-- heart logic: match bag arrivals to kept walkers by name + exact size
+--------------------------------------------------------------------
+local pending = {}   -- { {name=, size=, t=}, ... }
+
+local function tryHeart(item)
+    if not cfg.doHeart then return end
+    if item:GetAttribute("PlantName") then return end          -- skip plants
+    local id   = item:GetAttribute("ID")
+    local name = item:GetAttribute("Brainrot") or item:GetAttribute("ItemName")
+    local size = item:GetAttribute("Size")
+    if not (id and name and size) then return end
+    for i, p in ipairs(pending) do
+        if p.name == name and math.abs(p.size - size) < 0.0001 then
+            FavoriteItem:FireServer(id)
+            table.remove(pending, i)
+            setStatus("hearted " .. name)
+            return
+        end
+    end
+end
+
+BP.ChildAdded:Connect(function(item)
+    task.delay(0.3, function() tryHeart(item) end)
+end)
+
+--------------------------------------------------------------------
+-- lane watcher
+--------------------------------------------------------------------
+local function watch(model)
+    if not model:IsA("Model") then return end
+    local size = model:GetAttribute("Size")
+    local t0 = os.clock()
+    while size == nil and os.clock() - t0 < 3 do task.wait() size = model:GetAttribute("Size") end
+    local rarity = model:GetAttribute("Rarity")
+    local name   = model:GetAttribute("Brainrot")
+    if not (rarity and size and name and shouldKeep(rarity, size)) then return end
+
+    setStatus(("keeping %s  %dkg"):format(rarity, math.floor(size * 10)))
+    table.insert(pending, { name = name, size = size, t = os.clock() })
+    count[rarity] = (count[rarity] or 0) + 1
+    setFilter(rarity, true)
+
+    local done = false
+    model.AncestryChanged:Connect(function(_, parent)
+        if parent or done then return end
+        done = true
+        task.delay(2.5, function()
+            count[rarity] = math.max(0, (count[rarity] or 1) - 1)
+            if count[rarity] == 0 then setFilter(rarity, false) end
+        end)
+    end)
+end
+
+for _, m in ipairs(LANE:GetChildren()) do task.spawn(watch, m) end
+LANE.ChildAdded:Connect(function(m) task.spawn(watch, m) end)
+
+-- clear stale pending hearts that never landed
+task.spawn(function()
+    while true do
+        task.wait(10)
+        local now = os.clock()
+        for i = #pending, 1, -1 do
+            if now - pending[i].t > 30 then table.remove(pending, i) end
+        end
+    end
+end)
+
+setStatus("running")
+print("PvB Auto-Keep loaded")
