@@ -1,620 +1,59 @@
--- ============================================================
---  PvB Toolkit  (Coords + Open Cards + Delete Cards, merged)
--- ============================================================
---  • Coordinate + Camera Saver (all original features kept)
---  • OPEN CARDS  -> pick pack type (Shiny Expansion / Expansion /
---    Shiny Base / Base) from the dropdown, then Open Cards. This is
---    your original method: suppressor hides the popups, opens are
---    spammed, animations queue silently -> rejoin to clear them.
---    (Coords.stopOpen() re-enables popups without a rejoin.)
---  • DELETE CARDS -> sweep all pages, delete by tier-3 ownership
---    (keep 1 of each T3 variant; clear lowers only where the T3 is
---     already owned; keep everything you're still grinding).
--- ============================================================
+--==============================================================
+--  PvB Main UI  (merged, tabbed)
+--  Tabs: Teleport | Cards | Keep | Plant | Buy | Event | Misc
+--==============================================================
 
 local HttpService = game:GetService("HttpService")
 local Players     = game:GetService("Players")
 local UIS         = game:GetService("UserInputService")
+local RunService  = game:GetService("RunService")
 local CoreGui     = game:GetService("CoreGui")
 local RS          = game:GetService("ReplicatedStorage")
 local VIM         = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
+local unpackFn    = table.unpack or unpack
 
-local unpackFn = table.unpack or unpack
-
--- ===== Countdown Settings =====
-local COUNTDOWN_SECONDS = 90
-local countdownEndsAt = 0
-local countdownActiveName = nil
-local countdownLabel = nil
-
-local function formatCountdown(seconds)
-	seconds = math.max(0, math.ceil(seconds))
-	local m = math.floor(seconds / 60)
-	local s = seconds % 60
-	return string.format("%d:%02d", m, s)
-end
-
-local function updateCountdownLabel()
-	if not countdownLabel then return end
-	if countdownEndsAt <= 0 then countdownLabel.Text = "T --" return end
-	local remaining = countdownEndsAt - os.clock()
-	if remaining <= 0 then
-		countdownEndsAt = 0
-		countdownActiveName = nil
-		countdownLabel.Text = "T 0:00"
-	else
-		countdownLabel.Text = "T " .. formatCountdown(remaining)
-	end
-end
-
--- ===== Instant ProximityPrompt =====
-local function makePromptInstant(obj)
-	if obj:IsA("ProximityPrompt") then obj.HoldDuration = 0 end
-end
-for _, obj in ipairs(game:GetDescendants()) do makePromptInstant(obj) end
-game.DescendantAdded:Connect(makePromptInstant)
-
--- ===== Files =====
-local FOLDER = ".Cordinat"
-local FILE = FOLDER .. "/kito.json"
-local BACKUP_FILE = FOLDER .. "/kito_backup.json"
-
-local canWrite = (type(writefile) == "function" and type(readfile) == "function")
-local canFS = (type(isfile) == "function" and type(isfolder) == "function" and type(makefolder) == "function")
-if canFS and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
-
-local coordsCache = {}
-local tpHotkeyMap = {}
-local updHotkeyMap = {}
-local refreshList
-
-local function trim(s) return tostring(s or ""):match("^%s*(.-)%s*$") end
-
--- ===== Hotkey Helpers =====
-local numberNameToDisplay = {Zero="0",One="1",Two="2",Three="3",Four="4",Five="5",Six="6",Seven="7",Eight="8",Nine="9"}
-local displayToKeyName = {["0"]="Zero",["1"]="One",["2"]="Two",["3"]="Three",["4"]="Four",["5"]="Five",["6"]="Six",["7"]="Seven",["8"]="Eight",["9"]="Nine"}
-local modifierKeyNames = {LeftControl=true,RightControl=true,LeftShift=true,RightShift=true,LeftAlt=true,RightAlt=true}
-
-local keyNamesByLower = {}
-local displayNamesByLower = {}
-local function displayFromKeyCodeName(name) return numberNameToDisplay[name] or name end
-for _, item in ipairs(Enum.KeyCode:GetEnumItems()) do
-	local enumName = item.Name
-	keyNamesByLower[string.lower(enumName)] = enumName
-	displayNamesByLower[string.lower(displayFromKeyCodeName(enumName))] = enumName
-end
-
-local keyAliases = {esc="Escape",escape="Escape",enter="Return",returnkey="Return",space="Space",spacebar="Space",del="Delete",delete="Delete",backspace="Backspace",tab="Tab",capslock="CapsLock"}
-
-local function normalizeMainKey(part)
-	part = trim(part)
-	if part == "" then return nil end
-	local lower = string.lower(part)
-	if displayToKeyName[part] then return displayFromKeyCodeName(displayToKeyName[part]) end
-	if keyAliases[lower] then return displayFromKeyCodeName(keyAliases[lower]) end
-	if keyNamesByLower[lower] then return displayFromKeyCodeName(keyNamesByLower[lower]) end
-	if displayNamesByLower[lower] then return displayFromKeyCodeName(displayNamesByLower[lower]) end
-	return false
-end
-
-local function normalizeComboText(text)
-	text = trim(text)
-	if text == "" then return nil end
-	text = text:gsub("%s+", "")
-	local parts = {}
-	for part in string.gmatch(text, "[^+]+") do table.insert(parts, part) end
-	local ctrl, alt, shift, mainKey = false, false, false, nil
-	for _, part in ipairs(parts) do
-		local lower = string.lower(part)
-		if lower=="ctrl" or lower=="control" or lower=="leftcontrol" or lower=="rightcontrol" then ctrl=true
-		elseif lower=="alt" or lower=="leftalt" or lower=="rightalt" then alt=true
-		elseif lower=="shift" or lower=="leftshift" or lower=="rightshift" then shift=true
-		else
-			local key = normalizeMainKey(part)
-			if key == false then warn("Invalid hotkey key:", part) return false end
-			if mainKey then warn("Invalid combo, multiple main keys:", text) return false end
-			mainKey = key
-		end
-	end
-	if not mainKey then return false end
-	local combo = {}
-	if ctrl then table.insert(combo, "Ctrl") end
-	if alt then table.insert(combo, "Alt") end
-	if shift then table.insert(combo, "Shift") end
-	table.insert(combo, mainKey)
-	return table.concat(combo, "+")
-end
-
-local function isDown(key) return UIS:IsKeyDown(Enum.KeyCode[key]) end
-
-local function comboFromKeyCode(keyCode)
-	local keyName = keyCode.Name
-	if keyName == "Unknown" then return nil end
-	if modifierKeyNames[keyName] then return nil end
-	local combo = {}
-	if isDown("LeftControl") or isDown("RightControl") then table.insert(combo, "Ctrl") end
-	if isDown("LeftAlt") or isDown("RightAlt") then table.insert(combo, "Alt") end
-	if isDown("LeftShift") or isDown("RightShift") then table.insert(combo, "Shift") end
-	table.insert(combo, displayFromKeyCodeName(keyName))
-	return table.concat(combo, "+")
-end
-
--- ===== File Load / Save =====
-local function normalizeCoords(tbl)
-	if type(tbl) ~= "table" then return {} end
-	for name, data in pairs(tbl) do
-		if type(data) ~= "table" then tbl[name] = nil
-		else
-			if not data.pos and tonumber(data[1]) and tonumber(data[2]) and tonumber(data[3]) then
-				data = {pos={data[1],data[2],data[3]}, cam=data.cam, tpHotkey=data.tpHotkey or data.hotkey, updHotkey=data.updHotkey, countdownTimer=data.countdownTimer==true, order=data.order}
-				tbl[name] = data
-			end
-			if type(data.pos) ~= "table" then tbl[name] = nil
-			else
-				if data.hotkey and not data.tpHotkey then data.tpHotkey = data.hotkey end
-				data.hotkey = nil
-				data.countdownTimer = data.countdownTimer == true
-				if data.tpHotkey then local f = normalizeComboText(data.tpHotkey); data.tpHotkey = f ~= false and f or nil end
-				if data.updHotkey then local f = normalizeComboText(data.updHotkey); data.updHotkey = f ~= false and f or nil end
-			end
-		end
-	end
-	return tbl
-end
-
-local function readJsonFile(path)
-	if not canWrite then return nil end
-	if canFS and not isfile(path) then return nil end
-	local ok, data = pcall(readfile, path)
-	if not ok or not data or #data == 0 then return nil end
-	local success, tbl = pcall(function() return HttpService:JSONDecode(data) end)
-	if success and type(tbl) == "table" then return normalizeCoords(tbl) end
-	return nil
-end
-
-local function loadCoords()
-	local tbl = readJsonFile(FILE)
-	if not tbl then tbl = readJsonFile(BACKUP_FILE) end
-	if tbl then coordsCache = tbl end
-	return coordsCache
-end
-
-local function saveCoords(tbl)
-	if type(tbl) ~= "table" then return false end
-	coordsCache = tbl
-	if not canWrite then warn("writefile/readfile not supported. Coords are session-only.") return false end
-	if canFS and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
-	local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
-	if not ok then warn("Failed to encode coords.") return false end
-	local a = pcall(writefile, FILE, json)
-	local b = pcall(writefile, BACKUP_FILE, json)
-	return a or b
-end
-
--- ===== Ordering =====
-local function getSortedKeys(coords)
-	local keys = {}
-	for name in pairs(coords) do table.insert(keys, name) end
-	table.sort(keys, function(a, b)
-		local da, db = coords[a], coords[b]
-		local oa = da and da.order
-		local ob = db and db.order
-		if type(oa)=="number" and type(ob)=="number" and oa~=ob then return oa < ob end
-		if type(oa)=="number" and type(ob)~="number" then return true end
-		if type(oa)~="number" and type(ob)=="number" then return false end
-		return string.lower(a) < string.lower(b)
-	end)
-	return keys
-end
-
-local function applyOrders(coords, keys)
-	for i, name in ipairs(keys) do if coords[name] then coords[name].order = i end end
-end
-
-local function ensureOrders(coords)
-	local keys = getSortedKeys(coords)
-	local changed = false
-	for i, name in ipairs(keys) do
-		if coords[name] and coords[name].order ~= i then coords[name].order = i; changed = true end
-	end
-	return changed
-end
-
--- ===== Countdown Trigger Helpers =====
-local function toggleCountdownTrigger(name)
-	local coords = loadCoords()
-	local data = coords[name]
-	if not data then warn("Coord missing:", name) return false end
-	local currentlySelected = data.countdownTimer == true
-	for _, o in pairs(coords) do if type(o)=="table" then o.countdownTimer = false end end
-	if not currentlySelected then data.countdownTimer = true; print("[Timer] set:", name)
-	else print("[Timer] cleared:", name) end
-	saveCoords(coords)
-	return true
-end
-
-local function startCountdownIfNeeded(name)
-	local coords = loadCoords()
-	local data = coords[name]
-	if data and data.countdownTimer == true then
-		countdownActiveName = name
-		countdownEndsAt = os.clock() + COUNTDOWN_SECONDS
-		updateCountdownLabel()
-		print("[Timer] started:", name)
-	end
-end
-
--- ===== Hotkey Maps =====
-local function rebuildHotkeys()
-	tpHotkeyMap = {}
-	updHotkeyMap = {}
-	local coords = loadCoords()
-	for name, data in pairs(coords) do
-		if type(data) == "table" then
-			if data.tpHotkey and data.tpHotkey ~= "" then tpHotkeyMap[data.tpHotkey] = name end
-			if data.updHotkey and data.updHotkey ~= "" then updHotkeyMap[data.updHotkey] = name end
-		end
-	end
-end
-
-local function setCoordHotkey(name, field, hotkeyText)
-	local coords = loadCoords()
-	local data = coords[name]
-	if not data then warn("Coord missing:", name) return false end
-	local combo = normalizeComboText(hotkeyText)
-	if combo == false then return false end
-	for _, o in pairs(coords) do
-		if type(o) == "table" then
-			if o.tpHotkey == combo then o.tpHotkey = nil end
-			if o.updHotkey == combo then o.updHotkey = nil end
-		end
-	end
-	data[field] = combo
-	saveCoords(coords)
-	rebuildHotkeys()
-	return true
-end
-
--- ===== Position / Camera =====
-local function getPos()
-	local char = LocalPlayer.Character
-	if not char then return nil end
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if not hrp then return nil end
-	return hrp.Position
-end
-local function getCam()
-	local cam = workspace.CurrentCamera
-	if not cam then return nil end
-	return cam.CFrame
-end
-local function makeDefaultName(coords)
-	local i = 1
-	while coords["Pos_" .. i] do i = i + 1 end
-	return "Pos_" .. i
-end
-
-local function addCoord()
-	local pos = getPos()
-	if not pos then warn("Character not found.") return false end
-	local coords = loadCoords()
-	ensureOrders(coords)
-	local camCF = getCam()
-	local name = makeDefaultName(coords)
-	local keys = getSortedKeys(coords)
-	coords[name] = {pos={pos.X,pos.Y,pos.Z}, cam=camCF and {camCF:GetComponents()} or nil, tpHotkey=nil, updHotkey=nil, countdownTimer=false, order=#keys+1}
-	saveCoords(coords)
-	rebuildHotkeys()
-	print("[+] Saved:", name)
-	return true
-end
-
-local function updateCoord(name)
-	local coords = loadCoords()
-	local data = coords[name]
-	if not data then warn("Not found:", name) return false end
-	local pos = getPos()
-	if not pos then warn("Character not found.") return false end
-	local camCF = getCam()
-	data.pos = {pos.X, pos.Y, pos.Z}
-	data.cam = camCF and {camCF:GetComponents()} or nil
-	saveCoords(coords)
-	rebuildHotkeys()
-	print("[~] Updated:", name)
-	return true
-end
-
-local function tpCoord(name)
-	local coords = loadCoords()
-	local data = coords[name]
-	if not data then warn("Not found:", name) return false end
-	local char = LocalPlayer.Character
-	if not char then return false end
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	if not hrp then return false end
-	local posData = data.pos or data
-	if not posData then return false end
-	hrp.CFrame = CFrame.new(posData[1], posData[2], posData[3])
-	if data.cam then
-		local cam = workspace.CurrentCamera
-		if cam then
-			cam.CameraType = Enum.CameraType.Scriptable
-			cam.CFrame = CFrame.new(unpackFn(data.cam))
-			task.wait(0.25)
-			cam.CameraType = Enum.CameraType.Custom
-		end
-	end
-	print("[TP]", name)
-	startCountdownIfNeeded(name)
-	return true
-end
-
-local function delCoord(name)
-	local coords = loadCoords()
-	if coords[name] then
-		coords[name] = nil
-		local keys = getSortedKeys(coords)
-		applyOrders(coords, keys)
-		saveCoords(coords)
-		rebuildHotkeys()
-		print("[-] Deleted:", name)
-		return true
-	end
-	warn("Name not found:", name)
-	return false
-end
-
-local function renameCoord(oldName, newName)
-	newName = trim(newName)
-	if newName == "" then warn("Name cannot be blank.") return false end
-	if newName == oldName then return true end
-	local coords = loadCoords()
-	if coords[newName] then warn("Name exists:", newName) return false end
-	if not coords[oldName] then warn("Old coord missing:", oldName) return false end
-	coords[newName] = coords[oldName]
-	coords[oldName] = nil
-	saveCoords(coords)
-	rebuildHotkeys()
-	return true
-end
-
-local function listCoords()
-	local coords = loadCoords()
-	local keys = getSortedKeys(coords)
-	for _, name in ipairs(keys) do
-		local data = coords[name]
-		local p = data.pos or data
-		print(string.format("%s -> (%.2f, %.2f, %.2f)", name, p[1], p[2], p[3]))
-	end
-	if next(coords) == nil then print("(empty)") end
-end
-
--- ============================================================
---  OPEN CARDS
--- ============================================================
--- This is your original method, unchanged: suppressor hides the pack/card
--- popups, then we spam OpenHeldPack. Animations queue silently; rejoin to clear.
--- The ONLY addition is pack-type selection.
-local packOpRunning = false
-local suppressorActive = false
-
-local PACK_TYPES = {
-	{ label = "Shiny Expansion", match = function(n) return n:find("shiny")     and n:find("expansion") end },
-	{ label = "Expansion",       match = function(n) return n:find("expansion") and not n:find("shiny") end },
-	{ label = "Shiny Base",      match = function(n) return n:find("shiny")     and n:find("base") end },
-	{ label = "Base",            match = function(n) return n:find("base")      and not n:find("shiny") end },
-}
-local selectedPack = 1
-
-local function findPack(matchFn)
-	local char = LocalPlayer.Character
-	local backpack = LocalPlayer:FindFirstChild("Backpack")
-	if backpack then
-		for _, t in pairs(backpack:GetChildren()) do
-			if t:IsA("Tool") and matchFn(t.Name:lower()) then return t end
-		end
-	end
-	if char then
-		local h = char:FindFirstChildOfClass("Tool")
-		if h and matchFn(h.Name:lower()) then return h end
-	end
-end
-
-local function stopSuppressor()
-	getgenv().KillPackGui = false
-end
-
-local function openCards(setStatus)
-	setStatus = setStatus or function() end
-	if packOpRunning then setStatus("Already opening packs...") return end
-	packOpRunning = true
-	local packDef = PACK_TYPES[selectedPack]
-
-	-- suppressor (stays on until you rejoin, or call Coords.stopOpen())
-	getgenv().KillPackGui = true
-	if not suppressorActive then
-		suppressorActive = true
-		task.spawn(function()
-			local pg = LocalPlayer:WaitForChild("PlayerGui")
-			while getgenv().KillPackGui do
-				for _, gui in pairs(pg:GetChildren()) do
-					local n = gui.Name:lower()
-					if gui:IsA("ScreenGui") and (n:find("pack") or n:find("card")) then gui.Enabled = false end
-				end
-				task.wait(0.05)
-			end
-			suppressorActive = false
-		end)
-	end
-
-	-- fire loop (exactly your original)
-	task.spawn(function()
-		local opened = 0
-		for i = 1, 900 do
-			local char = LocalPlayer.Character
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			local p = findPack(packDef.match)
-			if not (p and hum) then break end
-			hum:EquipTool(p)
-			task.wait(0.05)
-			RS.Remotes.OpenHeldPack:FireServer()
-			task.wait(0.1)
-			opened = opened + 1
-			if opened % 10 == 0 then setStatus(("Opening %s... %d"):format(packDef.label, opened)) end
-		end
-		if opened == 0 then
-			setStatus("No '" .. packDef.label .. "' packs found in hotbar/backpack.")
-		else
-			setStatus(("Fired %d %s. Rejoin to clear the animations."):format(opened, packDef.label))
-		end
-		print("[OpenCards]", packDef.label, opened)
-		packOpRunning = false
-	end)
-end
-
--- ============================================================
---  DELETE CARDS
--- ============================================================
-local cardOpRunning = false
-
-local function deleteCards(setStatus)
-	setStatus = setStatus or function() end
-	if cardOpRunning then setStatus("Delete already running...") return end
-	cardOpRunning = true
-
-	task.spawn(function()
-		local ok, err = pcall(function()
-			local pg = LocalPlayer:WaitForChild("PlayerGui")
-			local sz = pg:FindFirstChild("SiblingZIndex")
-			local deck = sz and sz:FindFirstChild("DeckCreator")
-			local main = deck and deck:FindFirstChild("Main")
-			local Main_Content = main and main:FindFirstChild("Main_Content")
-			if not Main_Content then setStatus("Open the card menu first, then click Delete Cards.") return end
-			local Cards = Main_Content:FindFirstChild("Cards")
-			local DeleteCards = RS.Remotes.Cards.General.DeleteCards
-			if not Cards then setStatus("Card grid not found - reopen the menu.") return end
-
-			local function tierOf(t) t=(t or ""):upper()
-				if t:find("III") then return 3 elseif t:find("II") then return 2 else return 1 end end
-			local function readFrame(c)
-				local m=c:FindFirstChild("Main"); if not m then return nil end
-				local nl=m:FindFirstChild("Name"); local r=m:FindFirstChild("Rarity")
-				local a=nl and nl.Parent:FindFirstChild("Amount"); local cnt=1
-				if a and a.Text then local n=tonumber((a.Text:gsub("[^%d]",""))); if n and n>0 then cnt=n end end
-				return {name=nl and nl.Text or "?", tier=tierOf(r and r.Text), shiny=m:FindFirstChild("Hidden_Details")~=nil, count=cnt}
-			end
-			local function vkey(name,shiny) return (name:lower():gsub("^%s+",""):gsub("%s+$","")).."|"..(shiny and "S" or "N") end
-
-			local pageBox
-			for _,o in ipairs(Main_Content:GetDescendants()) do
-				if o:IsA("TextBox") and (o.Text or ""):match("%d+%s*/%s*%d+") then pageBox=o; break end
-			end
-			if not pageBox then setStatus("Page box not found - make sure cards are showing.") return end
-			local function curPage() return tonumber((pageBox.Text or ""):match("(%d+)")) end
-			local function maxPage() return tonumber((pageBox.Text or ""):match("/%s*(%d+)")) end
-			local function gotoPage(n)
-				for _=1,3 do
-					pcall(function()
-						pageBox:CaptureFocus(); task.wait(0.08)
-						pageBox.Text=tostring(n); task.wait(0.05)
-						VIM:SendKeyEvent(true,Enum.KeyCode.Return,false,game); task.wait(0.04)
-						VIM:SendKeyEvent(false,Enum.KeyCode.Return,false,game)
-						pcall(function() pageBox:ReleaseFocus(true) end)
-					end)
-					task.wait(0.5)
-					if curPage()==n then return true end
-				end
-				return false
-			end
-
-			local mx = maxPage()
-			if not mx then setStatus("Couldn't read page count.") return end
-			if not gotoPage(1) then setStatus("Couldn't navigate to page 1.") return end
-
-			local store = {}
-			for n=1,mx do
-				if curPage()~=n then gotoPage(n) end
-				task.wait(0.15)
-				for _,c in ipairs(Cards:GetChildren()) do
-					if c:IsA("Frame") and c.Name~="NormalTemplate" and c.Name~="ShinyTemplate" then
-						if not store[c.Name] then local i=readFrame(c); if i then i.uuid=c.Name; store[c.Name]=i end end
-					end
-				end
-				setStatus(("Reading page %d/%d"):format(n,mx))
-			end
-
-			local hasT3 = {}
-			for _,i in pairs(store) do if i.tier==3 and i.count>=1 then hasT3[vkey(i.name,i.shiny)] = true end end
-
-			local plan, totalFires = {}, 0
-			for _,i in pairs(store) do
-				local target
-				if i.tier==3 then target=1 else target = hasT3[vkey(i.name,i.shiny)] and 0 or i.count end
-				local fires = i.count - target
-				if fires > 0 then totalFires = totalFires + fires; table.insert(plan,{uuid=i.uuid, name=i.name, fires=fires}) end
-			end
-
-			if totalFires == 0 then setStatus("Nothing to delete - already clean.") return end
-
-            local queue = {}
-			for _, p in ipairs(plan) do
-				for _ = 1, p.fires do queue[#queue + 1] = p.uuid end
-			end
-			local BATCH = 25            -- uuids per call; drop to 10 if the server ignores big ones
-			local done = 0
-			for i = 1, #queue, BATCH do
-				local chunk = {}
-				for j = i, math.min(i + BATCH - 1, #queue) do chunk[#chunk + 1] = queue[j] end
-				DeleteCards:FireServer(chunk)
-				done = done + #chunk
-				setStatus(("Deleting %d/%d"):format(done, totalFires))
-				task.wait(0.12)
-			end
-			setStatus(("Done - deleted %d cards. Refresh to verify."):format(totalFires))
-			print("[DeleteCards] deleted", totalFires)
-		end)
-		if not ok then setStatus("Delete error: " .. tostring(err)); warn("[DeleteCards]", err) end
-		cardOpRunning = false
-	end)
-end
-
--- ============================================================
---  GUI
--- ============================================================
-local GUI_NAME = "PvBToolkitUI"
-pcall(function()
-	local old = CoreGui:FindFirstChild(GUI_NAME)
-	if old then old:Destroy() end
-end)
+----------------------------------------------------------------------
+--  SHELL
+----------------------------------------------------------------------
+local GUI_NAME = "PvBMainUI"
+pcall(function() local o = CoreGui:FindFirstChild(GUI_NAME); if o then o:Destroy() end end)
 
 local gui = Instance.new("ScreenGui")
 gui.Name = GUI_NAME
 gui.ResetOnSpawn = false
-local parented = false
-if type(gethui) == "function" then parented = pcall(function() gui.Parent = gethui() end) end
-if not parented then parented = pcall(function() gui.Parent = CoreGui end) end
-if not parented then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+local ok = false
+if type(gethui) == "function" then ok = pcall(function() gui.Parent = gethui() end) end
+if not ok then ok = pcall(function() gui.Parent = CoreGui end) end
+if not ok then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
 local C = {
-	bg=Color3.fromRGB(18,18,22), panel=Color3.fromRGB(28,28,34), row=Color3.fromRGB(40,40,48),
-	field=Color3.fromRGB(54,54,62), stroke=Color3.fromRGB(70,70,82),
-	green=Color3.fromRGB(46,160,110), blue=Color3.fromRGB(70,120,210), purple=Color3.fromRGB(140,92,205),
-	red=Color3.fromRGB(205,78,78), amber=Color3.fromRGB(190,140,45), grey=Color3.fromRGB(78,78,88),
+    bg=Color3.fromRGB(18,18,22), panel=Color3.fromRGB(28,28,34), row=Color3.fromRGB(40,40,48),
+    field=Color3.fromRGB(54,54,62), stroke=Color3.fromRGB(70,70,82),
+    green=Color3.fromRGB(46,160,110), blue=Color3.fromRGB(70,120,210), purple=Color3.fromRGB(140,92,205),
+    red=Color3.fromRGB(205,78,78), amber=Color3.fromRGB(190,140,45), grey=Color3.fromRGB(78,78,88),
+    txt=Color3.fromRGB(232,232,240), dim=Color3.fromRGB(160,160,172),
+    gray=Color3.fromRGB(46,46,52),
 }
 local function corner(p,r) local c=Instance.new("UICorner",p); c.CornerRadius=UDim.new(0,r or 6); return c end
-local function mkButton(parent,text,color,size,position)
-	local b=Instance.new("TextButton")
-	b.Text=text; b.BackgroundColor3=color; b.TextColor3=Color3.new(1,1,1); b.BorderSizePixel=0
-	b.Font=Enum.Font.GothamMedium; b.TextSize=12; b.AutoButtonColor=true
-	b.Size=size; b.Position=position; b.Parent=parent; corner(b,6); return b
+local function mkButton(parent,text,color,size,pos)
+    local b=Instance.new("TextButton")
+    b.Text=text; b.BackgroundColor3=color; b.TextColor3=Color3.new(1,1,1); b.BorderSizePixel=0
+    b.Font=Enum.Font.GothamMedium; b.TextSize=12; b.AutoButtonColor=true
+    b.Size=size; b.Position=pos; b.Parent=parent; corner(b,6); return b
+end
+local function mkLabel(parent,text,size,pos,color,font,tsize)
+    local l=Instance.new("TextLabel"); l.BackgroundTransparency=1; l.Text=text
+    l.Size=size; l.Position=pos; l.TextColor3=color or C.txt
+    l.Font=font or Enum.Font.Gotham; l.TextSize=tsize or 13
+    l.TextXAlignment=Enum.TextXAlignment.Left; l.Parent=parent; return l
 end
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 446, 0, 360)
-frame.Position = UDim2.new(0, 20, 0, 60)
+frame.Size = UDim2.fromOffset(420, 480)
+frame.Position = UDim2.fromOffset(40, 50)
 frame.BackgroundColor3 = C.bg
-frame.BackgroundTransparency = 0.10
+frame.BackgroundTransparency = 0.05
 frame.BorderSizePixel = 0
 frame.Active = true
 frame.Draggable = true
@@ -622,262 +61,1590 @@ frame.Parent = gui
 corner(frame, 12)
 do local s=Instance.new("UIStroke",frame); s.Thickness=1; s.Color=C.stroke; s.Transparency=0.4 end
 
--- forward decls so early button handlers can use them
-local statusLabel
-local function setStatus(t) if statusLabel then statusLabel.Text = tostring(t) end end
+mkLabel(frame, "PvB Toolkit", UDim2.fromOffset(170,22), UDim2.fromOffset(14,8), C.txt, Enum.Font.GothamBold, 15)
+local countdownLabel = mkLabel(frame, "T --", UDim2.fromOffset(66,22), UDim2.new(1,-172,0,8), Color3.new(1,1,1), Enum.Font.GothamBold, 13)
+countdownLabel.BackgroundColor3=C.panel; countdownLabel.BackgroundTransparency=0.1; countdownLabel.TextXAlignment=Enum.TextXAlignment.Center; corner(countdownLabel,6)
+local minBtn = mkButton(frame,"-",C.grey,UDim2.fromOffset(30,22),UDim2.new(1,-98,0,8)); minBtn.Font=Enum.Font.GothamBold; minBtn.TextSize=16
+local closeBtn = mkButton(frame,"X",C.red,UDim2.fromOffset(30,22),UDim2.new(1,-64,0,8)); closeBtn.Font=Enum.Font.GothamBold
 
--- header
-local title = Instance.new("TextLabel", frame)
-title.BackgroundTransparency=1; title.Position=UDim2.new(0,12,0,6); title.Size=UDim2.new(0,180,0,22)
-title.Font=Enum.Font.GothamBold; title.TextSize=14; title.TextXAlignment=Enum.TextXAlignment.Left
-title.TextColor3=Color3.fromRGB(235,235,240); title.Text="PvB Toolkit"
+local statusLabel = mkLabel(frame, "Ready.", UDim2.new(1,-28,0,16), UDim2.new(0,14,0,40), C.dim, Enum.Font.Gotham, 11)
+statusLabel.TextTruncate=Enum.TextTruncate.AtEnd
+local function setStatus(t) statusLabel.Text = tostring(t) end
 
-countdownLabel = Instance.new("TextLabel", frame)
-countdownLabel.Size=UDim2.new(0,72,0,24); countdownLabel.Position=UDim2.new(1,-150,0,5)
-countdownLabel.BackgroundColor3=C.panel; countdownLabel.BackgroundTransparency=0.1
-countdownLabel.TextColor3=Color3.new(1,1,1); countdownLabel.BorderSizePixel=0
-countdownLabel.Font=Enum.Font.GothamBold; countdownLabel.TextSize=13; countdownLabel.Text="T --"
-corner(countdownLabel,6)
+local tabBar = Instance.new("Frame"); tabBar.BackgroundTransparency=1
+tabBar.Size=UDim2.new(1,-20,0,28); tabBar.Position=UDim2.fromOffset(10,62); tabBar.Parent=frame
+local tabLayout=Instance.new("UIListLayout",tabBar); tabLayout.FillDirection=Enum.FillDirection.Horizontal
+tabLayout.Padding=UDim.new(0,2); tabLayout.SortOrder=Enum.SortOrder.LayoutOrder
 
-local minBtn = mkButton(frame, "-", C.grey, UDim2.new(0,30,0,24), UDim2.new(1,-72,0,5))
-minBtn.Font=Enum.Font.GothamBold; minBtn.TextSize=16
-local closeBtn = mkButton(frame, "X", C.red, UDim2.new(0,30,0,24), UDim2.new(1,-38,0,5))
-closeBtn.Font=Enum.Font.GothamBold; closeBtn.TextSize=13
+local body = Instance.new("Frame"); body.BackgroundTransparency=1
+body.Size=UDim2.new(1,-20,1,-102); body.Position=UDim2.fromOffset(10,96); body.Parent=frame
 
--- row 2: coord actions
-local saveBtn    = mkButton(frame, "+ Save Pos", C.green, UDim2.new(0,90,0,26), UDim2.new(0,12,0,36))
-local refreshBtn = mkButton(frame, "Refresh",    C.blue,  UDim2.new(0,84,0,26), UDim2.new(0,106,0,36))
-
--- row 3: card actions
-local packBtn = mkButton(frame, "v " .. PACK_TYPES[selectedPack].label, C.panel, UDim2.new(0,150,0,26), UDim2.new(0,12,0,66))
-packBtn.TextXAlignment = Enum.TextXAlignment.Left
-local pbPad = Instance.new("UIPadding", packBtn); pbPad.PaddingLeft = UDim.new(0,8)
-
-local openBtn   = mkButton(frame, "Open Cards", C.purple, UDim2.new(0,108,0,26), UDim2.new(0,170,0,66))
-local deleteBtn = mkButton(frame, "Delete Cards", C.amber, UDim2.new(0,124,0,26), UDim2.new(0,286,0,66))
-
--- pack dropdown overlay
-local dropFrame = Instance.new("Frame", frame)
-dropFrame.Visible = false
-dropFrame.Size = UDim2.new(0,120,0, (#PACK_TYPES*26)+((#PACK_TYPES-1)*2)+6)
-dropFrame.Position = UDim2.new(0,12,0,94)
-dropFrame.BackgroundColor3 = C.panel
-dropFrame.BorderSizePixel = 0
-dropFrame.ZIndex = 50
-corner(dropFrame,6)
-do local s=Instance.new("UIStroke",dropFrame); s.Color=C.stroke; s.Transparency=0.3; s.Thickness=1 end
-local dPad=Instance.new("UIPadding",dropFrame); dPad.PaddingTop=UDim.new(0,3); dPad.PaddingBottom=UDim.new(0,3); dPad.PaddingLeft=UDim.new(0,3); dPad.PaddingRight=UDim.new(0,3)
-local dLayout=Instance.new("UIListLayout",dropFrame); dLayout.Padding=UDim.new(0,2); dLayout.SortOrder=Enum.SortOrder.LayoutOrder
-for idx, pt in ipairs(PACK_TYPES) do
-	local opt = mkButton(dropFrame, pt.label, C.row, UDim2.new(1,0,0,26), UDim2.new(0,0,0,0))
-	opt.ZIndex = 51; opt.LayoutOrder = idx
-	opt.MouseButton1Click:Connect(function()
-		selectedPack = idx
-		packBtn.Text = "v " .. pt.label
-		dropFrame.Visible = false
-		setStatus("Pack set to " .. pt.label)
-	end)
+local tabs, tabBtns = {}, {}
+local function showTab(name)
+    for n,f in pairs(tabs) do f.Visible=(n==name) end
+    for n,b in pairs(tabBtns) do b.BackgroundColor3 = (n==name) and C.purple or C.panel end
+    if onTabShown then onTabShown(name) end
 end
-packBtn.MouseButton1Click:Connect(function() dropFrame.Visible = not dropFrame.Visible end)
+local function addTab(name)
+    local btn = mkButton(tabBar, name, C.panel, UDim2.fromOffset(55,28), UDim2.new())
+    btn.TextSize = 10
+    btn.LayoutOrder = #tabBtns + 1
+    local content = Instance.new("Frame"); content.Name=name; content.BackgroundTransparency=1
+    content.Size=UDim2.new(1,0,1,0); content.Visible=false; content.Parent=body
+    tabs[name]=content; tabBtns[name]=btn
+    btn.MouseButton1Click:Connect(function() showTab(name) end)
+    return content
+end
+onTabShown = nil
 
--- status line
-statusLabel = Instance.new("TextLabel", frame)
-statusLabel.BackgroundTransparency=1; statusLabel.Position=UDim2.new(0,12,0,98); statusLabel.Size=UDim2.new(1,-24,0,16)
-statusLabel.Font=Enum.Font.Gotham; statusLabel.TextSize=11; statusLabel.TextXAlignment=Enum.TextXAlignment.Left
-statusLabel.TextColor3=Color3.fromRGB(170,170,180); statusLabel.TextTruncate=Enum.TextTruncate.AtEnd
-statusLabel.Text="Ready. Pick a pack, then Open Cards (rejoin after to clear). Open the card menu before Delete."
+local tpTab    = addTab("Teleport")
+local cardTab  = addTab("Cards")
+local keepTab  = addTab("Keep")
+local plantTab = addTab("Plant")
+local buyTab   = addTab("Buy")
+local eventTab = addTab("Event")
+local miscTab  = addTab("Misc")
 
--- coordinate list
-local listFrame = Instance.new("ScrollingFrame", frame)
-listFrame.Size=UDim2.new(1,-16,1,-130); listFrame.Position=UDim2.new(0,8,0,118)
-listFrame.CanvasSize=UDim2.new(0,0,0,0); listFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
-listFrame.BackgroundColor3=C.panel; listFrame.BackgroundTransparency=0.15; listFrame.BorderSizePixel=0
-listFrame.ScrollBarThickness=6; corner(listFrame,8)
-local layout=Instance.new("UIListLayout",listFrame); layout.SortOrder=Enum.SortOrder.LayoutOrder; layout.Padding=UDim.new(0,4)
-local listPad=Instance.new("UIPadding",listFrame); listPad.PaddingTop=UDim.new(0,4); listPad.PaddingBottom=UDim.new(0,4); listPad.PaddingLeft=UDim.new(0,4); listPad.PaddingRight=UDim.new(0,4)
-
-local resizeHandle = Instance.new("TextButton", frame)
-resizeHandle.Size=UDim2.new(0,16,0,16); resizeHandle.Position=UDim2.new(1,-18,1,-18)
-resizeHandle.Text="//"; resizeHandle.BackgroundTransparency=1; resizeHandle.TextColor3=Color3.fromRGB(150,150,160)
-resizeHandle.Font=Enum.Font.GothamBold; resizeHandle.TextSize=12
-
--- minimize / close
-local minimized = false
-local oldSize = frame.Size
 closeBtn.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+pcall(function()
+    local CS = RS.Remotes:WaitForChild("ConfirmSell")
+    local function hidePrompts()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui") if not pg then return end
+        for _,d in ipairs(pg:GetDescendants()) do
+            if d:IsA("TextLabel") and type(d.Text)=="string" and d.Text:lower():find("sure you want to sell") then
+                local f=d while f and f.Parent and not f.Parent:IsA("ScreenGui") do f=f.Parent end
+                if f then pcall(function() f.Visible=false end) end
+            end
+        end
+    end
+    CS.OnClientEvent:Connect(function(p1,p2,p3)
+        pcall(function() CS:FireServer(p1,p2,p3,true) end)
+        for i=1,6 do task.wait(0.1) hidePrompts() end
+    end)
+end)
+
+local minimized, oldSize = false, frame.Size
 minBtn.MouseButton1Click:Connect(function()
-	minimized = not minimized
-	local show = not minimized
-	for _, b in ipairs({saveBtn,refreshBtn,packBtn,openBtn,deleteBtn,listFrame,resizeHandle,statusLabel,title}) do b.Visible = show end
-	dropFrame.Visible = false
-	if minimized then
-		oldSize = frame.Size
-		frame.Size = UDim2.new(0,200,0,36)
-		countdownLabel.Position = UDim2.new(0,12,0,6)
-	else
-		frame.Size = oldSize
-		countdownLabel.Position = UDim2.new(1,-150,0,5)
-	end
+    minimized = not minimized
+    tabBar.Visible = not minimized; body.Visible = not minimized; statusLabel.Visible = not minimized
+    if minimized then oldSize=frame.Size; frame.Size=UDim2.fromOffset(220,40)
+    else frame.Size=oldSize end
 end)
 
--- resize
-local resizing=false; local resizeStartMouse, resizeStartSize
-resizeHandle.InputBegan:Connect(function(input)
-	if input.UserInputType==Enum.UserInputType.MouseButton1 then
-		resizing=true; resizeStartMouse=UIS:GetMouseLocation(); resizeStartSize=frame.AbsoluteSize
-	end
-end)
-UIS.InputEnded:Connect(function(input)
-	if input.UserInputType==Enum.UserInputType.MouseButton1 then resizing=false end
-end)
-UIS.InputChanged:Connect(function(input)
-	if resizing and input.UserInputType==Enum.UserInputType.MouseMovement then
-		local m=UIS:GetMouseLocation(); local d=m-resizeStartMouse
-		local w=math.clamp(resizeStartSize.X+d.X,446,800)
-		local h=math.clamp(resizeStartSize.Y+d.Y,220,800)
-		frame.Size=UDim2.new(0,w,0,h)
-	end
-end)
+----------------------------------------------------------------------
+--  TELEPORT TAB
+----------------------------------------------------------------------
+do
+    local FOLDER, FILE, BACKUP = ".Cordinat", ".Cordinat/kito.json", ".Cordinat/kito_backup.json"
+    local canWrite = (type(writefile)=="function" and type(readfile)=="function")
+    local canFS = (type(isfile)=="function" and type(isfolder)=="function" and type(makefolder)=="function")
+    if canFS and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
 
--- drag reorder
-local draggingName=nil
-local ROW_HEIGHT=34
-local ROW_PAD=4
-local function moveCoordToIndex(coordName, targetIndex)
-	local coords=loadCoords(); local keys=getSortedKeys(coords)
-	local cur=table.find(keys,coordName); if not cur then return end
-	targetIndex=math.clamp(targetIndex,1,#keys); if cur==targetIndex then return end
-	table.remove(keys,cur); table.insert(keys,targetIndex,coordName)
-	applyOrders(coords,keys); saveCoords(coords)
+    local coordsCache, tpHotkeyMap, updHotkeyMap = {}, {}, {}
+    local refreshList
+    local COUNTDOWN_SECONDS = 90
+    local countdownEndsAt = 0
+    local function trim(s) return tostring(s or ""):match("^%s*(.-)%s*$") end
+
+    local function fmt(sec) sec=math.max(0,math.ceil(sec)); return string.format("%d:%02d", math.floor(sec/60), sec%60) end
+    local function updateCountdown()
+        if countdownEndsAt<=0 then countdownLabel.Text="T --" return end
+        local r=countdownEndsAt-os.clock()
+        if r<=0 then countdownEndsAt=0; countdownLabel.Text="T 0:00" else countdownLabel.Text="T "..fmt(r) end
+    end
+
+    local function instant(o) if o:IsA("ProximityPrompt") then o.HoldDuration=0 end end
+    for _,o in ipairs(game:GetDescendants()) do instant(o) end
+    game.DescendantAdded:Connect(instant)
+
+    local num2disp={Zero="0",One="1",Two="2",Three="3",Four="4",Five="5",Six="6",Seven="7",Eight="8",Nine="9"}
+    local disp2key={["0"]="Zero",["1"]="One",["2"]="Two",["3"]="Three",["4"]="Four",["5"]="Five",["6"]="Six",["7"]="Seven",["8"]="Eight",["9"]="Nine"}
+    local modKeys={LeftControl=true,RightControl=true,LeftShift=true,RightShift=true,LeftAlt=true,RightAlt=true}
+    local keyByLower, dispByLower = {}, {}
+    local function dispFrom(n) return num2disp[n] or n end
+    for _,it in ipairs(Enum.KeyCode:GetEnumItems()) do
+        keyByLower[it.Name:lower()]=it.Name; dispByLower[dispFrom(it.Name):lower()]=it.Name
+    end
+    local alias={esc="Escape",escape="Escape",enter="Return",space="Space",del="Delete",delete="Delete",tab="Tab"}
+    local function normMain(p) p=trim(p); if p=="" then return nil end local l=p:lower()
+        if disp2key[p] then return dispFrom(disp2key[p]) end
+        if alias[l] then return dispFrom(alias[l]) end
+        if keyByLower[l] then return dispFrom(keyByLower[l]) end
+        if dispByLower[l] then return dispFrom(dispByLower[l]) end
+        return false end
+    local function normCombo(text) text=trim(text); if text=="" then return nil end text=text:gsub("%s+","")
+        local parts={}; for p in text:gmatch("[^+]+") do table.insert(parts,p) end
+        local ctrl,alt,shift,main=false,false,false,nil
+        for _,p in ipairs(parts) do local l=p:lower()
+            if l=="ctrl" or l=="control" then ctrl=true elseif l=="alt" then alt=true elseif l=="shift" then shift=true
+            else local k=normMain(p); if k==false then return false end if main then return false end main=k end end
+        if not main then return false end
+        local c={} if ctrl then table.insert(c,"Ctrl") end if alt then table.insert(c,"Alt") end if shift then table.insert(c,"Shift") end
+        table.insert(c,main); return table.concat(c,"+") end
+    local function isDown(k) return UIS:IsKeyDown(Enum.KeyCode[k]) end
+    local function comboFromKC(kc) local n=kc.Name if n=="Unknown" or modKeys[n] then return nil end
+        local c={} if isDown("LeftControl") or isDown("RightControl") then table.insert(c,"Ctrl") end
+        if isDown("LeftAlt") or isDown("RightAlt") then table.insert(c,"Alt") end
+        if isDown("LeftShift") or isDown("RightShift") then table.insert(c,"Shift") end
+        table.insert(c,dispFrom(n)); return table.concat(c,"+") end
+
+    local function readJson(path)
+        if not canWrite then return nil end
+        if canFS and not isfile(path) then return nil end
+        local ok2,d = pcall(readfile,path); if not ok2 or not d or #d==0 then return nil end
+        local ok3,t = pcall(function() return HttpService:JSONDecode(d) end)
+        return (ok3 and type(t)=="table") and t or nil
+    end
+    local function loadCoords() local t=readJson(FILE) or readJson(BACKUP); if t then coordsCache=t end return coordsCache end
+    local function saveCoords(t) coordsCache=t
+        if not canWrite then return false end
+        if canFS and not isfolder(FOLDER) then pcall(makefolder,FOLDER) end
+        local ok2,j=pcall(function() return HttpService:JSONEncode(t) end); if not ok2 then return false end
+        local a=pcall(writefile,FILE,j); local b=pcall(writefile,BACKUP,j); return a or b end
+
+    local function sortedKeys(c) local k={} for n in pairs(c) do table.insert(k,n) end
+        table.sort(k,function(a,b) local oa,ob=c[a] and c[a].order, c[b] and c[b].order
+            if type(oa)=="number" and type(ob)=="number" and oa~=ob then return oa<ob end
+            if type(oa)=="number" and type(ob)~="number" then return true end
+            if type(oa)~="number" and type(ob)=="number" then return false end
+            return a:lower()<b:lower() end) return k end
+    local function applyOrders(c,k) for i,n in ipairs(k) do if c[n] then c[n].order=i end end end
+
+    local function getPos() local ch=LocalPlayer.Character; local h=ch and ch:FindFirstChild("HumanoidRootPart"); return h and h.Position end
+    local function getCam() local cam=workspace.CurrentCamera; return cam and cam.CFrame end
+    local function defName(c) local i=1 while c["Pos_"..i] do i=i+1 end return "Pos_"..i end
+
+    local function rebuildHotkeys() tpHotkeyMap,updHotkeyMap={},{} local c=loadCoords()
+        for n,d in pairs(c) do if type(d)=="table" then
+            if d.tpHotkey and d.tpHotkey~="" then tpHotkeyMap[d.tpHotkey]=n end
+            if d.updHotkey and d.updHotkey~="" then updHotkeyMap[d.updHotkey]=n end end end end
+    local function setHotkey(name,field,text) local c=loadCoords() local d=c[name] if not d then return false end
+        local combo=normCombo(text) if combo==false then return false end
+        for _,o in pairs(c) do if type(o)=="table" then if o.tpHotkey==combo then o.tpHotkey=nil end if o.updHotkey==combo then o.updHotkey=nil end end end
+        d[field]=combo saveCoords(c) rebuildHotkeys() return true end
+
+    local function addCoord() local p=getPos() if not p then setStatus("No character.") return false end
+        local c=loadCoords() local cam=getCam() local n=defName(c) local k=sortedKeys(c)
+        c[n]={pos={p.X,p.Y,p.Z},cam=cam and {cam:GetComponents()} or nil,countdownTimer=false,order=#k+1}
+        saveCoords(c) rebuildHotkeys() return true end
+    local function updateCoord(name) local c=loadCoords() local d=c[name] if not d then return false end
+        local p=getPos() if not p then return false end local cam=getCam()
+        d.pos={p.X,p.Y,p.Z} d.cam=cam and {cam:GetComponents()} or nil saveCoords(c) rebuildHotkeys() return true end
+    local function tpCoord(name) local c=loadCoords() local d=c[name] if not d then return false end
+        local ch=LocalPlayer.Character local h=ch and ch:FindFirstChild("HumanoidRootPart") if not h then return false end
+        local pd=d.pos or d h.CFrame=CFrame.new(pd[1],pd[2],pd[3])
+        if d.cam then local cam=workspace.CurrentCamera if cam then cam.CameraType=Enum.CameraType.Scriptable
+            cam.CFrame=CFrame.new(unpackFn(d.cam)) task.wait(0.25) cam.CameraType=Enum.CameraType.Custom end end
+        if d.countdownTimer then countdownEndsAt=os.clock()+COUNTDOWN_SECONDS updateCountdown() end
+        return true end
+    local function delCoord(name) local c=loadCoords() if c[name] then c[name]=nil applyOrders(c,sortedKeys(c)) saveCoords(c) rebuildHotkeys() return true end return false end
+    local function renameCoord(o,n) n=trim(n) if n=="" then return false end if n==o then return true end
+        local c=loadCoords() if c[n] or not c[o] then return false end c[n]=c[o] c[o]=nil saveCoords(c) rebuildHotkeys() return true end
+    local function toggleTimer(name) local c=loadCoords() local d=c[name] if not d then return false end
+        local was=d.countdownTimer==true for _,o in pairs(c) do if type(o)=="table" then o.countdownTimer=false end end
+        d.countdownTimer = not was saveCoords(c) return true end
+
+    local saveBtn  = mkButton(tpTab,"+ Save Pos",C.green,UDim2.fromOffset(96,26),UDim2.fromOffset(0,0))
+    local refBtn   = mkButton(tpTab,"Refresh",C.blue,UDim2.fromOffset(84,26),UDim2.fromOffset(102,0))
+    local antiBtn  = mkButton(tpTab,"AntiAFK: OFF",C.grey,UDim2.fromOffset(110,26),UDim2.fromOffset(192,0))
+    do
+        local VU = nil pcall(function() VU = game:GetService("VirtualUser") end)
+        LocalPlayer.Idled:Connect(function()
+            if getgenv().PvBAntiAFK and VU then
+                pcall(function() VU:CaptureController() VU:ClickButton2(Vector2.new()) end)
+            end
+        end)
+        antiBtn.MouseButton1Click:Connect(function()
+            getgenv().PvBAntiAFK = not getgenv().PvBAntiAFK
+            local on = getgenv().PvBAntiAFK
+            antiBtn.Text = "AntiAFK: "..(on and "ON" or "OFF")
+            antiBtn.BackgroundColor3 = on and C.green or C.grey
+            setStatus("Anti-AFK "..(on and "on (idle kick disabled)" or "off"))
+        end)
+    end
+    local listFrame=Instance.new("ScrollingFrame",tpTab)
+    listFrame.Size=UDim2.new(1,0,1,-34); listFrame.Position=UDim2.fromOffset(0,32)
+    listFrame.BackgroundColor3=C.panel; listFrame.BackgroundTransparency=0.15; listFrame.BorderSizePixel=0
+    listFrame.ScrollBarThickness=6; listFrame.CanvasSize=UDim2.new(); listFrame.AutomaticCanvasSize=Enum.AutomaticSize.Y
+    corner(listFrame,8)
+    local ll=Instance.new("UIListLayout",listFrame); ll.SortOrder=Enum.SortOrder.LayoutOrder; ll.Padding=UDim.new(0,4)
+    local lp=Instance.new("UIPadding",listFrame); lp.PaddingTop=UDim.new(0,4); lp.PaddingLeft=UDim.new(0,4); lp.PaddingRight=UDim.new(0,4)
+
+    local ROW_H=34
+    local draggingName=nil
+    local function moveTo(name,idx) local c=loadCoords() local k=sortedKeys(c) local cur=table.find(k,name) if not cur then return end
+        idx=math.clamp(idx,1,#k) if cur==idx then return end table.remove(k,cur) table.insert(k,idx,name) applyOrders(c,k) saveCoords(c) end
+
+    local activeBox=nil
+    local function bindBox(box,name,field,old)
+        box.Focused:Connect(function() activeBox=box box.PlaceholderText="press" end)
+        box.FocusLost:Connect(function() if activeBox==box then activeBox=nil end
+            if setHotkey(name,field,box.Text) then if refreshList then task.defer(refreshList) end else box.Text=old or "" end end)
+    end
+
+    refreshList=function()
+        local c=loadCoords()
+        for _,v in pairs(listFrame:GetChildren()) do if v:IsA("Frame") then v:Destroy() end end
+        for i,name in ipairs(sortedKeys(c)) do local d=c[name]
+            local item=Instance.new("Frame",listFrame); item.Size=UDim2.new(1,-8,0,ROW_H); item.BackgroundColor3=C.row
+            item.BackgroundTransparency=0.05; item.BorderSizePixel=0; item.LayoutOrder=d.order or i; corner(item,7)
+            local function el(w,x) return UDim2.new(0,w,1,-6), UDim2.fromOffset(x,3) end
+            local drag=mkButton(item,"=",Color3.fromRGB(60,60,70),el(22,3)); drag.AutoButtonColor=false
+            local nameBox=Instance.new("TextBox",item); nameBox.Size,nameBox.Position=el(90,28)
+            nameBox.Text=name; nameBox.ClearTextOnFocus=false; nameBox.BackgroundColor3=C.field; nameBox.TextColor3=Color3.new(1,1,1)
+            nameBox.BorderSizePixel=0; nameBox.Font=Enum.Font.Gotham; nameBox.TextSize=12; corner(nameBox,5)
+            local tpKey=Instance.new("TextBox",item); tpKey.Size,tpKey.Position=el(50,122)
+            tpKey.PlaceholderText="TP"; tpKey.Text=d.tpHotkey or ""; tpKey.ClearTextOnFocus=false; tpKey.BackgroundColor3=C.field
+            tpKey.TextColor3=Color3.new(1,1,1); tpKey.BorderSizePixel=0; tpKey.Font=Enum.Font.Gotham; tpKey.TextSize=11; corner(tpKey,5)
+            local updKey=Instance.new("TextBox",item); updKey.Size,updKey.Position=el(50,174)
+            updKey.PlaceholderText="UPD"; updKey.Text=d.updHotkey or ""; updKey.ClearTextOnFocus=false; updKey.BackgroundColor3=C.field
+            updKey.TextColor3=Color3.new(1,1,1); updKey.BorderSizePixel=0; updKey.Font=Enum.Font.Gotham; updKey.TextSize=11; corner(updKey,5)
+            local tBtn=mkButton(item,d.countdownTimer and "T" or "o",d.countdownTimer and C.amber or Color3.fromRGB(64,64,74),el(24,226))
+            local tpBtn=mkButton(item,"TP",C.grey,el(30,253))
+            local upBtn=mkButton(item,"UPD",Color3.fromRGB(180,120,45),el(38,285))
+            local dBtn=mkButton(item,"DEL",C.red,el(34,325))
+            drag.InputBegan:Connect(function(io) if io.UserInputType==Enum.UserInputType.MouseButton1 then draggingName=name end end)
+            nameBox.FocusLost:Connect(function() local nn=trim(nameBox.Text) if nn~=name then if renameCoord(name,nn) then refreshList() else nameBox.Text=name end end end)
+            bindBox(tpKey,name,"tpHotkey",d.tpHotkey); bindBox(updKey,name,"updHotkey",d.updHotkey)
+            tBtn.MouseButton1Click:Connect(function() if toggleTimer(name) then refreshList() end end)
+            tpBtn.MouseButton1Click:Connect(function() tpCoord(name) end)
+            upBtn.MouseButton1Click:Connect(function() if updateCoord(name) then refreshList() end end)
+            dBtn.MouseButton1Click:Connect(function() if delCoord(name) then refreshList() end end)
+        end
+    end
+
+    saveBtn.MouseButton1Click:Connect(function() if addCoord() then refreshList() setStatus("Saved position.") end end)
+    refBtn.MouseButton1Click:Connect(function() rebuildHotkeys() refreshList() setStatus("Refreshed.") end)
+
+    UIS.InputBegan:Connect(function(input)
+        if input.UserInputType~=Enum.UserInputType.Keyboard then return end
+        local fb=UIS:GetFocusedTextBox()
+        if activeBox and fb==activeBox then
+            if input.KeyCode==Enum.KeyCode.Backspace or input.KeyCode==Enum.KeyCode.Delete then activeBox.Text="" activeBox:ReleaseFocus() return end
+            if input.KeyCode==Enum.KeyCode.Escape then activeBox:ReleaseFocus() return end
+            local c=comboFromKC(input.KeyCode) if c then activeBox.Text=c activeBox:ReleaseFocus() end return end
+        if fb then return end
+        local c=comboFromKC(input.KeyCode) if not c then return end
+        local u=updHotkeyMap[c] if u then if updateCoord(u) then refreshList() end return end
+        local t=tpHotkeyMap[c] if t then tpCoord(t) end
+    end)
+    UIS.InputChanged:Connect(function(input) if draggingName and input.UserInputType==Enum.UserInputType.MouseMovement then
+        local y=UIS:GetMouseLocation().Y - listFrame.AbsolutePosition.Y + listFrame.CanvasPosition.Y
+        moveTo(draggingName, math.floor(y/(ROW_H+4))+1) refreshList() end end)
+    UIS.InputEnded:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 then draggingName=nil end end)
+
+    task.spawn(function() while gui.Parent do updateCountdown() task.wait(0.2) end end)
+    loadCoords(); rebuildHotkeys(); refreshList()
 end
 
--- hotkey box recording
-local activeHotkeyBox=nil
-local function connectHotkeyBox(box, name, field, oldValue)
-	box.Focused:Connect(function() activeHotkeyBox=box; box.PlaceholderText="press" end)
-	box.FocusLost:Connect(function()
-		if activeHotkeyBox==box then activeHotkeyBox=nil end
-		local ok=setCoordHotkey(name,field,box.Text)
-		if ok then if refreshList then task.defer(refreshList) end else box.Text=oldValue or "" end
-	end)
+----------------------------------------------------------------------
+--  CARDS TAB
+----------------------------------------------------------------------
+do
+    local packOpRunning, suppressorActive = false, false
+    local PACK_TYPES = {
+        { label="Shiny Expansion", match=function(n) return n:find("shiny") and n:find("expansion") end },
+        { label="Expansion",       match=function(n) return n:find("expansion") and not n:find("shiny") end },
+        { label="Shiny Base",      match=function(n) return n:find("shiny") and n:find("base") end },
+        { label="Base",            match=function(n) return n:find("base") and not n:find("shiny") end },
+    }
+    local selectedPack = 1
+    local function findPack(m) local bp=LocalPlayer:FindFirstChild("Backpack")
+        if bp then for _,t in ipairs(bp:GetChildren()) do if t:IsA("Tool") and m(t.Name:lower()) then return t end end end
+        local ch=LocalPlayer.Character local h=ch and ch:FindFirstChildOfClass("Tool") if h and m(h.Name:lower()) then return h end end
+
+    local function openCards()
+        if packOpRunning then setStatus("Already opening...") return end
+        packOpRunning=true local def=PACK_TYPES[selectedPack]
+        getgenv().KillPackGui=true
+        if not suppressorActive then suppressorActive=true task.spawn(function()
+            local pg=LocalPlayer:WaitForChild("PlayerGui")
+            while getgenv().KillPackGui do for _,g in pairs(pg:GetChildren()) do local n=g.Name:lower()
+                if g:IsA("ScreenGui") and (n:find("pack") or n:find("card")) then g.Enabled=false end end task.wait(0.05) end
+            suppressorActive=false end) end
+        task.spawn(function() local opened=0
+            for i=1,900 do local ch=LocalPlayer.Character local hum=ch and ch:FindFirstChildOfClass("Humanoid")
+                local p=findPack(def.match) if not (p and hum) then break end
+                hum:EquipTool(p) task.wait(0.05) RS.Remotes.OpenHeldPack:FireServer() task.wait(0.1) opened+=1
+                if opened%10==0 then setStatus(("Opening %s... %d"):format(def.label,opened)) end end
+            setStatus(opened==0 and ("No '"..def.label.."' packs found.") or (("Fired %d %s. Rejoin to clear animations."):format(opened,def.label)))
+            packOpRunning=false end)
+    end
+
+    local function deleteCards()
+        task.spawn(function() local ok2,err=pcall(function()
+            local pg=LocalPlayer:WaitForChild("PlayerGui")
+            local sz=pg:FindFirstChild("SiblingZIndex") local deck=sz and sz:FindFirstChild("DeckCreator")
+            local mc=deck and deck:FindFirstChild("Main") mc=mc and mc:FindFirstChild("Main_Content")
+            if not mc then setStatus("Open the card menu first.") return end
+            local Cards=mc:FindFirstChild("Cards") local DeleteCards=RS.Remotes.Cards.General.DeleteCards
+            if not Cards then setStatus("Card grid not found.") return end
+            local function tierOf(t) t=(t or ""):upper() if t:find("III") then return 3 elseif t:find("II") then return 2 else return 1 end end
+            local function readFrame(c) local m=c:FindFirstChild("Main") if not m then return nil end
+                local nl=m:FindFirstChild("Name") local r=m:FindFirstChild("Rarity")
+                local a=nl and nl.Parent:FindFirstChild("Amount") local cnt=1
+                if a and a.Text then local n=tonumber((a.Text:gsub("[^%d]",""))) if n and n>0 then cnt=n end end
+                return {name=nl and nl.Text or "?",tier=tierOf(r and r.Text),shiny=m:FindFirstChild("Hidden_Details")~=nil,count=cnt} end
+            local function vkey(n,s) return (n:lower():gsub("^%s+",""):gsub("%s+$","")).."|"..(s and "S" or "N") end
+            local pageBox for _,o in ipairs(mc:GetDescendants()) do if o:IsA("TextBox") and (o.Text or ""):match("%d+%s*/%s*%d+") then pageBox=o break end end
+            if not pageBox then setStatus("Page box not found.") return end
+            local function cur() return tonumber((pageBox.Text or ""):match("(%d+)")) end
+            local function maxp() return tonumber((pageBox.Text or ""):match("/%s*(%d+)")) end
+            local function goto(n) for _=1,3 do pcall(function() pageBox:CaptureFocus() task.wait(0.08) pageBox.Text=tostring(n)
+                task.wait(0.05) VIM:SendKeyEvent(true,Enum.KeyCode.Return,false,game) task.wait(0.04) VIM:SendKeyEvent(false,Enum.KeyCode.Return,false,game)
+                pcall(function() pageBox:ReleaseFocus(true) end) end) task.wait(0.5) if cur()==n then return true end end return false end
+            local mx=maxp() if not mx then setStatus("Couldn't read page count.") return end
+            if not goto(1) then setStatus("Couldn't go to page 1.") return end
+            local store={} for n=1,mx do if cur()~=n then goto(n) end task.wait(0.15)
+                for _,c in ipairs(Cards:GetChildren()) do if c:IsA("Frame") and c.Name~="NormalTemplate" and c.Name~="ShinyTemplate" then
+                    if not store[c.Name] then local i=readFrame(c) if i then i.uuid=c.Name store[c.Name]=i end end end end
+                setStatus(("Reading page %d/%d"):format(n,mx)) end
+            local hasT3={} for _,i in pairs(store) do if i.tier==3 and i.count>=1 then hasT3[vkey(i.name,i.shiny)]=true end end
+            local plan,total={},0 for _,i in pairs(store) do local target
+                if i.tier==3 then target=1 else target=hasT3[vkey(i.name,i.shiny)] and 0 or i.count end
+                local f=i.count-target if f>0 then total=total+f table.insert(plan,{uuid=i.uuid,fires=f}) end end
+            if total==0 then setStatus("Nothing to delete - already clean.") return end
+            local queue={} for _,p in ipairs(plan) do for _=1,p.fires do queue[#queue+1]=p.uuid end end
+            local BATCH,done=25,0
+            for i=1,#queue,BATCH do local chunk={} for j=i,math.min(i+BATCH-1,#queue) do chunk[#chunk+1]=queue[j] end
+                DeleteCards:FireServer(chunk) done=done+#chunk setStatus(("Deleting %d/%d"):format(done,total)) task.wait(0.12) end
+            setStatus(("Done - deleted %d cards."):format(total))
+        end) if not ok2 then setStatus("Delete error: "..tostring(err)) end end)
+    end
+
+    local packBtn = mkButton(cardTab,"v "..PACK_TYPES[selectedPack].label,C.panel,UDim2.fromOffset(150,28),UDim2.fromOffset(0,0))
+    packBtn.TextXAlignment=Enum.TextXAlignment.Left local pp=Instance.new("UIPadding",packBtn) pp.PaddingLeft=UDim.new(0,8)
+    local openBtn=mkButton(cardTab,"Open Cards",C.purple,UDim2.fromOffset(108,28),UDim2.fromOffset(158,0))
+    local delBtn=mkButton(cardTab,"Delete Cards",C.amber,UDim2.fromOffset(120,28),UDim2.fromOffset(272,0))
+    local stopBtn=mkButton(cardTab,"Stop suppressor (re-enable popups)",C.grey,UDim2.fromOffset(392,26),UDim2.fromOffset(0,36))
+    mkLabel(cardTab,"Pick a pack, Open Cards, then rejoin to clear animations. Open the card menu before Delete.",
+        UDim2.new(1,0,0,40),UDim2.fromOffset(0,70),C.dim,Enum.Font.Gotham,11).TextWrapped=true
+
+    local drop=Instance.new("Frame",cardTab) drop.Visible=false drop.Size=UDim2.fromOffset(150,(#PACK_TYPES*28)+8)
+    drop.Position=UDim2.fromOffset(0,30) drop.BackgroundColor3=C.panel drop.BorderSizePixel=0 drop.ZIndex=50 corner(drop,6)
+    local dl=Instance.new("UIListLayout",drop) dl.Padding=UDim.new(0,2) local dpad=Instance.new("UIPadding",drop)
+    dpad.PaddingTop=UDim.new(0,3) dpad.PaddingLeft=UDim.new(0,3) dpad.PaddingRight=UDim.new(0,3)
+    for idx,pt in ipairs(PACK_TYPES) do local opt=mkButton(drop,pt.label,C.row,UDim2.new(1,0,0,26),UDim2.new()) opt.ZIndex=51 opt.LayoutOrder=idx
+        opt.MouseButton1Click:Connect(function() selectedPack=idx packBtn.Text="v "..pt.label drop.Visible=false setStatus("Pack: "..pt.label) end) end
+    packBtn.MouseButton1Click:Connect(function() drop.Visible=not drop.Visible end)
+    openBtn.MouseButton1Click:Connect(function() setStatus("Opening...") openCards() end)
+    delBtn.MouseButton1Click:Connect(function() setStatus("Deleting...") deleteCards() end)
+    stopBtn.MouseButton1Click:Connect(function() getgenv().KillPackGui=false setStatus("Suppressor stopped.") end)
 end
 
-UIS.InputBegan:Connect(function(input)
-	if input.UserInputType~=Enum.UserInputType.Keyboard then return end
-	local focusedBox=UIS:GetFocusedTextBox()
-	if activeHotkeyBox and focusedBox==activeHotkeyBox then
-		if input.KeyCode==Enum.KeyCode.Backspace or input.KeyCode==Enum.KeyCode.Delete then
-			activeHotkeyBox.Text=""; activeHotkeyBox:ReleaseFocus(); return
-		end
-		if input.KeyCode==Enum.KeyCode.Escape then activeHotkeyBox:ReleaseFocus(); return end
-		local combo=comboFromKeyCode(input.KeyCode)
-		if combo then activeHotkeyBox.Text=combo; activeHotkeyBox:ReleaseFocus() end
-		return
-	end
-	if focusedBox then return end
-	local combo=comboFromKeyCode(input.KeyCode)
-	if not combo then return end
-	local updName=updHotkeyMap[combo]
-	if updName then if updateCoord(updName) and refreshList then refreshList() end return end
-	local tpName=tpHotkeyMap[combo]
-	if tpName then tpCoord(tpName) end
-end)
+----------------------------------------------------------------------
+--  KEEP TAB  (filter flips at the kill line)
+----------------------------------------------------------------------
+do
+    local AutoSell = RS.Remotes.AutoSell
+    local FavoriteItem = RS.Remotes.FavoriteItem
+    local LANE = workspace:WaitForChild("ScriptedMap"):WaitForChild("MissionBrainrots")
+    local BP = LocalPlayer:WaitForChild("Backpack")
 
--- refresh list
-refreshList = function()
-	local coords=loadCoords()
-	local changed=ensureOrders(coords)
-	if changed then saveCoords(coords) end
-	for _, v in pairs(listFrame:GetChildren()) do if v:IsA("Frame") then v:Destroy() end end
-	local keys=getSortedKeys(coords)
-	for i, name in ipairs(keys) do
-		local data=coords[name]
-		local item=Instance.new("Frame", listFrame)
-		item.Size=UDim2.new(1,-8,0,ROW_HEIGHT); item.BackgroundColor3=C.row; item.BackgroundTransparency=0.05
-		item.BorderSizePixel=0; item.LayoutOrder=data.order or i; corner(item,7)
+    local KEEP_Z = 595
 
-		local dragBtn=mkButton(item,"=",Color3.fromRGB(60,60,70),UDim2.new(0,22,1,-6),UDim2.new(0,3,0,3))
-		dragBtn.Font=Enum.Font.GothamBold; dragBtn.TextSize=14; dragBtn.AutoButtonColor=false; dragBtn.TextColor3=Color3.fromRGB(205,205,215)
+    -- DEFAULTS: keep on, forbidden on, 1M-only mode on, secrets >=75kg always
+    -- kept, anything >=150kg kept, junk-sell on.
+    local cfg    = { enabled=true, keepForbidden=true, keepSecretKg=75, keepAnyKg=150, doHeart=true, invManage=true, keepOneMil=true }
+    local staged = { enabled=true, keepForbidden=true, keepSecretKg=75, keepAnyKg=150, doHeart=true, invManage=true, keepOneMil=true }
+    local function kgToSize(kg) return kg/10 end
+    local secretNames = {}
 
-		local nameBox=Instance.new("TextBox",item)
-		nameBox.Size=UDim2.new(0,80,1,-6); nameBox.Position=UDim2.new(0,30,0,3); nameBox.Text=name
-		nameBox.ClearTextOnFocus=false; nameBox.BackgroundColor3=C.field; nameBox.TextColor3=Color3.new(1,1,1)
-		nameBox.BorderSizePixel=0; nameBox.Font=Enum.Font.Gotham; nameBox.TextSize=12; corner(nameBox,5)
+    local function meetsCriteria(rarity,size)
+        if cfg.keepForbidden and rarity=="Forbidden" then return true end
+        if size and size>kgToSize(cfg.keepAnyKg) then return true end
+        return false
+    end
+    local function shouldKeep(rarity,size)
+        return cfg.enabled and meetsCriteria(rarity,size)
+    end
 
-		local tpKeyBox=Instance.new("TextBox",item)
-		tpKeyBox.Size=UDim2.new(0,55,1,-6); tpKeyBox.Position=UDim2.new(0,114,0,3); tpKeyBox.PlaceholderText="TP key"
-		tpKeyBox.Text=data.tpHotkey or ""; tpKeyBox.ClearTextOnFocus=false; tpKeyBox.BackgroundColor3=C.field
-		tpKeyBox.TextColor3=Color3.new(1,1,1); tpKeyBox.BorderSizePixel=0; tpKeyBox.Font=Enum.Font.Gotham; tpKeyBox.TextSize=11; corner(tpKeyBox,5)
+    local filterOn, touched = {}, {}
+    local function setFilter(rarity,want)
+        if (filterOn[rarity] or false)~=want then AutoSell:FireServer(rarity) filterOn[rarity]=want end
+    end
 
-		local updKeyBox=Instance.new("TextBox",item)
-		updKeyBox.Size=UDim2.new(0,60,1,-6); updKeyBox.Position=UDim2.new(0,173,0,3); updKeyBox.PlaceholderText="UPD key"
-		updKeyBox.Text=data.updHotkey or ""; updKeyBox.ClearTextOnFocus=false; updKeyBox.BackgroundColor3=C.field
-		updKeyBox.TextColor3=Color3.new(1,1,1); updKeyBox.BorderSizePixel=0; updKeyBox.Font=Enum.Font.Gotham; updKeyBox.TextSize=11; corner(updKeyBox,5)
+    local pending={}
+    local function tryHeart(item)
+        if item:GetAttribute("PlantName") then return end
+        local id=item:GetAttribute("ID") local name=item:GetAttribute("Brainrot") or item:GetAttribute("ItemName") local size=item:GetAttribute("Size")
+        if not (id and name and size) then return end
+        for i,p in ipairs(pending) do if p.name==name and math.abs(p.size-size)<0.0001 then
+            FavoriteItem:FireServer(id) table.remove(pending,i) setStatus("hearted "..name) return end end
+    end
+    local PD2 pcall(function() PD2 = require(RS:WaitForChild("PlayerData")) end)
+    local function isFav(id)
+        if PD2 then local ok2,fav=pcall(function() return PD2:GetData().Data.Favorites end)
+            if ok2 and type(fav)=="table" then local f=fav[id] return f~=nil and f~=false end end
+        return false
+    end
+    local function setFav(id,want) if isFav(id)~=want then FavoriteItem:FireServer(id) end end
+    local function mutOf(item)
+        local ms=item:GetAttribute("MutationString")
+        local base=item:GetAttribute("Brainrot") or item:GetAttribute("ItemName")
+        if ms and base and ms~=base then return ms end
+        return "Normal"
+    end
+    local function secretKeeps(item)
+        local size=tonumber(item:GetAttribute("Size")) or 0
+        if size > kgToSize(cfg.keepSecretKg) then return true end
+        if not cfg.keepOneMil then return true end
+        return (tonumber(item:GetAttribute("Worth")) or 0) >= 1000000
+    end
+    local decided = {}
+    local function secretHandler(item)
+        local id=item:GetAttribute("ID") if not id then return end
+        if decided[id] then return end
+        decided[id]=true
+        task.wait(0.25)
+        local keep=secretKeeps(item)
+        setFav(id,keep)
+        local w=tonumber(item:GetAttribute("Worth")) or 0
+        setStatus((keep and "kept Secret (%s worth=%d)" or "selling Secret (%s worth=%d)"):format(mutOf(item),w))
+    end
+    local function resweepSecrets()
+        for _,t in ipairs(BP:GetChildren()) do
+            if t:IsA("Tool") and t:GetAttribute("ID") and not t:GetAttribute("PlantName")
+               and t:GetAttribute("Rarity")=="Secret" then
+                local id=t:GetAttribute("ID")
+                decided[id]=true
+                setFav(id, secretKeeps(t))
+                task.wait(0.05)
+            end
+        end
+        setStatus("re-swept secrets in bag")
+    end
+    local lastArrival = 0
+    BP.ChildAdded:Connect(function(item)
+        if item:IsA("Tool") and item:GetAttribute("ID") and not item:GetAttribute("PlantName") then
+            lastArrival=os.clock()
+            local nm=item:GetAttribute("Brainrot") or item:GetAttribute("ItemName")
+            if nm and secretNames[nm] then task.delay(0.25,function() secretHandler(item) end) return end
+        end
+        task.delay(0.3,function() tryHeart(item) end)
+    end)
 
-		local timerBtn=mkButton(item, data.countdownTimer and "T" or "o",
-			data.countdownTimer and C.amber or Color3.fromRGB(64,64,74), UDim2.new(0,24,1,-6), UDim2.new(0,237,0,3))
-		timerBtn.Font=Enum.Font.GothamBold; timerBtn.TextSize=12
+    local ItemSell = RS.Remotes:WaitForChild("ItemSell")
+    local function hasLooseBrainrot()
+        for _,t in ipairs(BP:GetChildren()) do
+            if t:IsA("Tool") and t:GetAttribute("ID") and not t:GetAttribute("PlantName") then return true end
+        end
+        return false
+    end
+    task.spawn(function()
+        while true do
+            task.wait(15)
+            if cfg.invManage and hasLooseBrainrot() and (os.clock()-lastArrival)>3 then
+                ItemSell:FireServer()
+                setStatus("auto-sold loose brainrots")
+            end
+        end
+    end)
 
-		local tpBtn=mkButton(item,"TP",C.grey,UDim2.new(0,32,1,-6),UDim2.new(1,-118,0,3))
-		local updBtn=mkButton(item,"UPD",Color3.fromRGB(180,120,45),UDim2.new(0,40,1,-6),UDim2.new(1,-82,0,3))
-		local delBtn=mkButton(item,"DEL",C.red,UDim2.new(0,36,1,-6),UDim2.new(1,-39,0,3))
+    local function modelZ(model)
+        local ok2,pos = pcall(function() return model:GetPivot().Position end)
+        if ok2 and pos then return pos.Z end
+        local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+        return part and part.Position.Z
+    end
 
-		dragBtn.InputBegan:Connect(function(io)
-			if io.UserInputType==Enum.UserInputType.MouseButton1 then draggingName=name; dragBtn.Text="^v" end
-		end)
-		nameBox.FocusLost:Connect(function()
-			local newName=trim(nameBox.Text)
-			if newName~=name then if renameCoord(name,newName) then refreshList() else nameBox.Text=name end end
-		end)
-		connectHotkeyBox(tpKeyBox,name,"tpHotkey",data.tpHotkey)
-		connectHotkeyBox(updKeyBox,name,"updHotkey",data.updHotkey)
-		timerBtn.MouseButton1Click:Connect(function() if toggleCountdownTrigger(name) then refreshList() end end)
-		tpBtn.MouseButton1Click:Connect(function() tpCoord(name) end)
-		updBtn.MouseButton1Click:Connect(function() if updateCoord(name) then refreshList() end end)
-		delBtn.MouseButton1Click:Connect(function() if delCoord(name) then refreshList() end end)
-	end
+    local keepers = {}
+    local function watch(model)
+        if not model:IsA("Model") then return end
+        local size=model:GetAttribute("Size") local t0=os.clock()
+        while size==nil and os.clock()-t0<3 do task.wait() size=model:GetAttribute("Size") end
+        local rarity=model:GetAttribute("Rarity") local name=model:GetAttribute("Brainrot")
+        if not (rarity and size and name) then return end
+        if rarity=="Secret" then
+            secretNames[name]=true
+            keepers[model]="Secret" touched["Secret"]=true
+            setStatus("collecting Secret "..name)
+            return
+        end
+        if not shouldKeep(rarity,size) then return end
+        setStatus(("keeping %s %dkg"):format(rarity, math.floor(size*10)))
+        table.insert(pending,{name=name,size=size,t=os.clock()})
+        keepers[model]=rarity
+        touched[rarity]=true
+    end
+    for _,m in ipairs(LANE:GetChildren()) do task.spawn(watch,m) end
+    LANE.ChildAdded:Connect(function(m) task.spawn(watch,m) end)
+
+    RunService.Heartbeat:Connect(function()
+        local want={}
+        for model,rarity in pairs(keepers) do
+            if not model.Parent then
+                keepers[model]=nil
+            else
+                local z=modelZ(model)
+                if z and z>=KEEP_Z then want[rarity]=true end
+            end
+        end
+        for rarity in pairs(touched) do
+            setFilter(rarity, want[rarity]==true)
+        end
+    end)
+    task.spawn(function() while true do task.wait(10) local now=os.clock()
+        for i=#pending,1,-1 do if now-pending[i].t>30 then table.remove(pending,i) end end end end)
+
+    local y=0
+    local function row(h) local r=Instance.new("Frame",keepTab) r.BackgroundTransparency=1 r.Size=UDim2.new(1,0,0,h) r.Position=UDim2.fromOffset(0,y) y=y+h+6 return r end
+    local applyHint
+    local function markDirty()
+        local dirty=false for k,v in pairs(staged) do if cfg[k]~=v then dirty=true break end end
+        if applyHint then applyHint.Text = dirty and "unsaved changes" or "" end
+    end
+    local function toggle(text,key)
+        local r=row(26) local b=mkButton(r,"",C.row,UDim2.new(1,0,1,0),UDim2.new()) b.AutoButtonColor=true
+        mkLabel(b,text,UDim2.new(1,-44,1,0),UDim2.fromOffset(8,0),C.txt,Enum.Font.Gotham,13)
+        local pip=mkLabel(b,"",UDim2.fromOffset(34,18),UDim2.new(1,-40,0.5,-9),Color3.new(1,1,1),Enum.Font.GothamBold,11)
+        pip.TextXAlignment=Enum.TextXAlignment.Center corner(pip,5)
+        local function rf() pip.Text=cfg[key] and "ON" or "OFF" pip.BackgroundColor3=cfg[key] and C.green or C.grey end
+        b.MouseButton1Click:Connect(function() cfg[key]=not cfg[key] staged[key]=cfg[key] rf() markDirty() end) rf()
+    end
+    local function input(text,key)
+        local r=row(26) mkLabel(r,text,UDim2.new(1,-70,1,0),UDim2.new(),C.txt,Enum.Font.Gotham,13)
+        local box=Instance.new("TextBox",r) box.Size=UDim2.fromOffset(62,24) box.Position=UDim2.new(1,-62,0.5,-12)
+        box.BackgroundColor3=C.field box.TextColor3=Color3.new(1,1,1) box.Font=Enum.Font.GothamMedium box.TextSize=13
+        box.Text=tostring(staged[key]) box.ClearTextOnFocus=false corner(box,6)
+        box.FocusLost:Connect(function() local n=tonumber(box.Text) if n then staged[key]=n else box.Text=tostring(staged[key]) end markDirty() end)
+    end
+
+    mkLabel(keepTab,"Auto-Keep",UDim2.new(1,0,0,18),UDim2.new(),C.txt,Enum.Font.GothamBold,14) y=22
+    toggle("Enabled","enabled")
+    toggle("Keep all Forbidden","keepForbidden")
+    toggle("Secret mode: 1M only (off = keep all)","keepOneMil")
+    input("Keep secrets over (kg)","keepSecretKg")
+    input("Keep anything over (kg)","keepAnyKg")
+    toggle("Auto-sell junk in bag","invManage")
+    local arow=row(30)
+    local applyBtn=mkButton(arow,"Apply",C.green,UDim2.fromOffset(90,28),UDim2.new())
+    applyHint=mkLabel(arow,"",UDim2.new(1,-100,1,0),UDim2.fromOffset(100,0),C.amber,Enum.Font.Gotham,12)
+    applyBtn.MouseButton1Click:Connect(function()
+        for k,v in pairs(staged) do cfg[k]=v end
+        markDirty() resweepSecrets()
+    end)
+    mkLabel(keepTab,"Every secret is collected, then kept or sold in the bag by the rule above. Forbidden + anything over the kg line are kept on the lane.",
+        UDim2.new(1,0,0,40),UDim2.fromOffset(0,y),C.dim,Enum.Font.Gotham,11).TextWrapped=true
 end
 
-UIS.InputChanged:Connect(function(input)
-	if draggingName and input.UserInputType==Enum.UserInputType.MouseMovement then
-		local mouseY=UIS:GetMouseLocation().Y
-		local relativeY=mouseY-listFrame.AbsolutePosition.Y+listFrame.CanvasPosition.Y
-		local targetIndex=math.floor(relativeY/(ROW_HEIGHT+ROW_PAD))+1
-		moveCoordToIndex(draggingName,targetIndex); refreshList()
-	end
-end)
-UIS.InputEnded:Connect(function(input)
-	if input.UserInputType==Enum.UserInputType.MouseButton1 then draggingName=nil end
-end)
+----------------------------------------------------------------------
+--  PLANT TAB  (garden grid, per-tile grow timers, after-grown actions)
+----------------------------------------------------------------------
+do
+    local CollectionService = game:GetService("CollectionService")
+    local PlantSeed    = RS.Remotes:WaitForChild("Seeds"):WaitForChild("PlantSeed")
+    local Pickup       = RS.Remotes:WaitForChild("Plants"):WaitForChild("Pickup")
+    local FavoriteItem = RS.Remotes:WaitForChild("FavoriteItem")
+    local ItemSell     = RS.Remotes:WaitForChild("ItemSell")
+    local BP           = LocalPlayer:WaitForChild("Backpack")
 
--- wiring
-saveBtn.MouseButton1Click:Connect(function() if addCoord() then refreshList(); setStatus("Saved position.") end end)
-refreshBtn.MouseButton1Click:Connect(function() rebuildHotkeys(); refreshList(); setStatus("Refreshed.") end)
-openBtn.MouseButton1Click:Connect(function() setStatus("Starting opens..."); openCards(setStatus) end)
-deleteBtn.MouseButton1Click:Connect(function() setStatus("Starting delete sweep..."); deleteCards(setStatus) end)
+    local PlantRegistry
+    pcall(function()
+        PlantRegistry = require(RS:WaitForChild("Modules"):WaitForChild("Registries"):WaitForChild("PlantRegistry"))
+    end)
+    local function growTimeFor(seedName)
+        if not (PlantRegistry and seedName) then return nil end
+        local e = PlantRegistry[seedName]
+        if e and tonumber(e.GrowTime) then return tonumber(e.GrowTime) end
+        e = PlantRegistry[(seedName:gsub("%s*Seed$",""))]
+        if e and tonumber(e.GrowTime) then return tonumber(e.GrowTime) end
+        return nil
+    end
 
-task.spawn(function() while gui and gui.Parent do updateCountdownLabel(); task.wait(0.2) end end)
+    local function getMyPlot()
+        local plots = workspace:FindFirstChild("Plots")
+        if not plots then return nil end
+        for _,p in ipairs(plots:GetChildren()) do
+            if p:GetAttribute("Owner") == LocalPlayer.UserId then return p end
+        end
+    end
+    local function tileToPos(tile) return (tile.CFrame * CFrame.new(0, tile.Size.Y/2, 0)).Position end
+    local function plantable(tile)
+        return tile ~= nil and tile:IsA("BasePart")
+            and tile:GetAttribute("CanPlace") == true
+            and not tile:GetAttribute("Occupied")
+    end
+    local function listSeeds()
+        local out = {}
+        for _,c in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+            if c then for _,t in ipairs(c:GetChildren()) do
+                local sn = t:IsA("Tool") and t:GetAttribute("SeedName")
+                if sn then table.insert(out, { label=t.Name, seedName=sn, colors=t:GetAttribute("Colors"), qty=tonumber(t:GetAttribute("Quantity")) or 1 }) end
+            end end
+        end
+        table.sort(out, function(a,b) return a.label:lower() < b.label:lower() end)
+        return out
+    end
+    local function plantOnTile(tile)
+        local best,bd
+        for _,p in ipairs(CollectionService:GetTagged("Plants")) do
+            if p:GetAttribute("Owner")==LocalPlayer.UserId and p:GetAttribute("ID") then
+                local pos
+                if p:IsA("Model") then local ok2,c=pcall(function() return p:GetPivot().Position end) if ok2 then pos=c end
+                elseif p:IsA("BasePart") then pos=p.Position end
+                if pos then
+                    local dx,dz = pos.X-tile.Position.X, pos.Z-tile.Position.Z
+                    local d = math.sqrt(dx*dx+dz*dz)
+                    if d<4 and (not bd or d<bd) then best,bd=p,d end
+                end
+            end
+        end
+        return best
+    end
+    local function fmtT(s)
+        s=math.max(0,math.ceil(s))
+        if s>=60 then return ("%d:%02d"):format(math.floor(s/60),s%60) end
+        return s.."s"
+    end
 
-loadCoords(); rebuildHotkeys(); refreshList(); updateCountdownLabel()
+    local selectedSeed = nil
+    local assign = {}
+    local active = {}
+    local cells  = {}
+    local act    = { pickup=false, sell=false, fav=false }
 
-getgenv().Coords = {
-	add = function() if addCoord() then refreshList() end end,
-	tp = tpCoord,
-	update = function(name) if updateCoord(name) then refreshList() end end,
-	remove = function(name) if delCoord(name) then refreshList() end end,
-	rename = function(o,n) if renameCoord(o,n) then refreshList() end end,
-	tpHotkey = function(name,key) if setCoordHotkey(name,"tpHotkey",key) then refreshList() end end,
-	updateHotkey = function(name,key) if setCoordHotkey(name,"updHotkey",key) then refreshList() end end,
-	timer = function(name) if toggleCountdownTrigger(name) then refreshList() end end,
-	list = listCoords,
-	refresh = function() rebuildHotkeys(); refreshList() end,
-	setPack = function(i) if PACK_TYPES[i] then selectedPack=i; packBtn.Text="v "..PACK_TYPES[i].label end end,
-	stopOpen = function() stopSuppressor() print("suppressor stopped (popups re-enabled)") end,
-	openCards = function() openCards(print) end,
-	deleteCards = function() deleteCards(print) end,
-	instantPrompts = function() for _, obj in ipairs(game:GetDescendants()) do makePromptInstant(obj) end print("re-applied instant prompts") end,
-}
+    local function countAssignedTo(name) local n=0 for _,e in pairs(assign) do if e.seedName==name then n=n+1 end end return n end
 
-print("PvB Toolkit active.")
-print("Open Cards = your original suppressor + spam (rejoin to clear animations). Pick pack type from the dropdown.")
-print("Coords.stopOpen() re-enables popups without rejoining if you ever need it.")
+    local seedBtn = mkButton(plantTab,"v Pick a seed",C.panel,UDim2.fromOffset(200,26),UDim2.fromOffset(0,0))
+    seedBtn.TextXAlignment=Enum.TextXAlignment.Left local spad=Instance.new("UIPadding",seedBtn) spad.PaddingLeft=UDim.new(0,8)
+    local refreshBtn = mkButton(plantTab,"Refresh",C.blue,UDim2.fromOffset(82,26),UDim2.fromOffset(206,0))
+    local clearBtn   = mkButton(plantTab,"Clear",C.grey,UDim2.fromOffset(70,26),UDim2.fromOffset(292,0))
+
+    local toggRow = Instance.new("Frame",plantTab) toggRow.BackgroundTransparency=1
+    toggRow.Size=UDim2.new(1,0,0,24) toggRow.Position=UDim2.fromOffset(0,32)
+    local rfP,rfS,rfF
+    local function refreshActs() if rfP then rfP() end if rfS then rfS() end if rfF then rfF() end end
+    local function miniToggle(text,x,w,getv,setv)
+        local b=mkButton(toggRow,text,C.row,UDim2.fromOffset(w,24),UDim2.fromOffset(x,0)) b.TextSize=11
+        local function rf()
+            local on=getv()
+            b.BackgroundColor3 = on and C.green or C.row
+        end
+        b.MouseButton1Click:Connect(function() setv(not getv()) refreshActs() end)
+        return rf
+    end
+    rfP = miniToggle("Pick up when grown",0,150,function() return act.pickup end,function(v)
+        act.pickup=v if not v then act.sell=false act.fav=false end end)
+    rfS = miniToggle("then Sell",156,86,function() return act.sell end,function(v)
+        if not act.pickup then return end act.sell=v if v then act.fav=false end end)
+    rfF = miniToggle("then Favorite",246,108,function() return act.fav end,function(v)
+        if not act.pickup then return end act.fav=v if v then act.sell=false end end)
+    refreshActs()
+
+    local gridHolder = Instance.new("Frame",plantTab)
+    gridHolder.BackgroundColor3=C.panel gridHolder.BackgroundTransparency=0.2 gridHolder.BorderSizePixel=0
+    gridHolder.Size=UDim2.new(1,0,1,-96) gridHolder.Position=UDim2.fromOffset(0,62) corner(gridHolder,8)
+    local gridInner = Instance.new("Frame",gridHolder) gridInner.BackgroundTransparency=1
+    gridInner.AnchorPoint=Vector2.new(0.5,0.5) gridInner.Position=UDim2.new(0.5,0,0.5,0)
+
+    local plantBtn  = mkButton(plantTab,"Plant",C.green,UDim2.fromOffset(120,30),UDim2.new(0,0,1,-32))
+    local infoLabel = mkLabel(plantTab,"",UDim2.new(1,-130,0,30),UDim2.new(0,128,1,-30),C.dim,Enum.Font.Gotham,12)
+
+    local function updateInfo()
+        local n=0 for _ in pairs(assign) do n=n+1 end
+        infoLabel.Text = n.." queued"..(selectedSeed and (" | "..selectedSeed.label.." x"..selectedSeed.qty) or "")
+    end
+    local function styleCell(tile,btn,free)
+        if active[tile] then btn.BackgroundColor3=C.blue
+        elseif assign[tile] then btn.BackgroundColor3=C.green
+        elseif free then btn.BackgroundColor3=Color3.fromRGB(58,92,58)
+        else btn.BackgroundColor3=Color3.fromRGB(104,40,40) end
+        btn.Text = assign[tile] and assign[tile].label:sub(1,1):upper() or ""
+    end
+    local function refreshCellStyles()
+        for tile,cell in pairs(cells) do styleCell(tile,cell.btn,plantable(tile)) end
+    end
+
+    local rebuildGrid, rebuildSeedDrop
+    local function pickupTile(tile, sellAfter, favAfter)
+        local p=plantOnTile(tile)
+        if not p then setStatus("no plant found on that tile") return false end
+        local id=p:GetAttribute("ID")
+        Pickup:FireServer(id)
+        active[tile]=nil
+        local cell=cells[tile] if cell and cell.timer then cell.timer.Text="" end
+        refreshCellStyles()
+        task.spawn(function()
+            local tool,t=nil,0
+            while not tool and t<3 do
+                task.wait(0.2) t+=0.2
+                for _,c in ipairs({ BP, LocalPlayer.Character }) do
+                    if c then for _,it in ipairs(c:GetChildren()) do
+                        if it:IsA("Tool") and it:GetAttribute("ID")==id then tool=it break end
+                    end end
+                    if tool then break end
+                end
+            end
+            if favAfter and tool then
+                FavoriteItem:FireServer(id) setStatus("picked up + favorited")
+            elseif sellAfter and tool then
+                local char=LocalPlayer.Character local hum=char and char:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    local prev=char:FindFirstChildWhichIsA("Tool")
+                    hum:EquipTool(tool)
+                    local w=0 while tool.Parent~=char and w<1 do task.wait(0.03) w+=0.03 end
+                    ItemSell:FireServer(true) task.wait(0.2)
+                    if prev and prev.Parent==BP then pcall(function() hum:EquipTool(prev) end) end
+                end
+                setStatus("picked up + sold")
+            else
+                setStatus("picked up")
+            end
+            if rebuildGrid then rebuildGrid() end
+        end)
+        return true
+    end
+    local function handleGrown(tile,a)
+        if a.pickup then pickupTile(tile, a.sell, a.fav) return end
+        a.done=true
+        local cell=cells[tile] if cell and cell.timer then cell.timer.Text="done" end
+        refreshCellStyles()
+    end
+
+    rebuildGrid = function()
+        for _,cell in pairs(cells) do if cell.btn then cell.btn:Destroy() end end
+        cells={}
+        for _,ch in ipairs(gridInner:GetChildren()) do if ch:IsA("UIGridLayout") then ch:Destroy() end end
+        local plot=getMyPlot()
+        if not plot then gridInner.Size=UDim2.fromOffset(10,10) setStatus("Plant: couldn't find your plot.") return end
+        local rowsFolder=plot:FindFirstChild("Rows")
+        if not rowsFolder then setStatus("Plant: no Rows under your plot.") return end
+        local tiles={}
+        for _,r in ipairs(rowsFolder:GetChildren()) do local g=r:FindFirstChild("Grass")
+            if g then for _,t in ipairs(g:GetChildren()) do if t:IsA("BasePart") then table.insert(tiles,t) end end end end
+        if #tiles==0 then setStatus("Plant: no tiles found.") return end
+        local function centers(vals) table.sort(vals) local out={}
+            for _,v in ipairs(vals) do if #out==0 or math.abs(v-out[#out])>2 then table.insert(out,v) end end return out end
+        local function nearest(list,v) local bi,bd=1,math.huge
+            for i,c in ipairs(list) do local d=math.abs(c-v) if d<bd then bd=d bi=i end end return bi end
+        local xs,zs={},{} for _,t in ipairs(tiles) do table.insert(xs,t.Position.X) table.insert(zs,t.Position.Z) end
+        local xC,zC=centers(xs),centers(zs)
+        local numCols,numRows=#xC,#zC
+        if numCols==0 or numRows==0 then setStatus("Plant: empty plot grid.") return end
+        local FLIP_ROWS,FLIP_COLS=true,true
+        local grid={} for r=1,numRows do grid[r]={} end
+        for _,t in ipairs(tiles) do
+            local ci=nearest(xC,t.Position.X) local ri=nearest(zC,t.Position.Z)
+            if FLIP_ROWS then ri=numRows-ri+1 end
+            if FLIP_COLS then ci=numCols-ci+1 end
+            grid[ri][ci]=t
+        end
+        local CELL,PAD=28,3
+        gridInner.Size=UDim2.fromOffset(numCols*CELL+(numCols-1)*PAD, numRows*CELL+(numRows-1)*PAD)
+        local layout=Instance.new("UIGridLayout",gridInner) layout.CellSize=UDim2.fromOffset(CELL,CELL)
+        layout.CellPadding=UDim2.fromOffset(PAD,PAD) layout.FillDirectionMaxCells=numCols layout.SortOrder=Enum.SortOrder.LayoutOrder
+        local lo=0
+        for r=1,numRows do for c=1,numCols do lo=lo+1
+            local tile=grid[r][c]
+            local btn=Instance.new("TextButton",gridInner) btn.LayoutOrder=lo btn.Text="" btn.BorderSizePixel=0
+            btn.AutoButtonColor=false btn.Font=Enum.Font.GothamBold btn.TextSize=12 btn.TextColor3=Color3.new(1,1,1) corner(btn,4)
+            local timer=Instance.new("TextLabel",btn) timer.BackgroundTransparency=1 timer.Size=UDim2.new(1,0,1,0)
+            timer.Font=Enum.Font.GothamBold timer.TextSize=9 timer.TextColor3=Color3.new(1,1,1) timer.Text=""
+            if tile then
+                cells[tile]={btn=btn,timer=timer}
+                styleCell(tile,btn,plantable(tile))
+                btn.MouseButton1Click:Connect(function()
+                    if active[tile] then pickupTile(tile) return end
+                    if assign[tile] then assign[tile]=nil styleCell(tile,btn,plantable(tile)) updateInfo() return end
+                    if not plantable(tile) then return end
+                    if not selectedSeed then setStatus("Pick a seed first.") return end
+                    if countAssignedTo(selectedSeed.seedName) >= selectedSeed.qty then
+                        setStatus("Only "..selectedSeed.qty.." "..selectedSeed.label.." in your bag.") return end
+                    assign[tile]=selectedSeed styleCell(tile,btn,false) updateInfo()
+                end)
+            else
+                btn.BackgroundColor3=C.gray
+            end
+        end end
+        updateInfo()
+        setStatus(("Plant grid: %dx%d"):format(numRows,numCols))
+    end
+
+    local seedDrop=Instance.new("Frame",plantTab) seedDrop.Visible=false seedDrop.BackgroundColor3=C.panel
+    seedDrop.BorderSizePixel=0 seedDrop.ZIndex=50 seedDrop.Position=UDim2.fromOffset(0,28) seedDrop.Size=UDim2.fromOffset(200,8) corner(seedDrop,6)
+    local sdl=Instance.new("UIListLayout",seedDrop) sdl.Padding=UDim.new(0,2)
+    local sdp=Instance.new("UIPadding",seedDrop) sdp.PaddingTop=UDim.new(0,3) sdp.PaddingLeft=UDim.new(0,3) sdp.PaddingRight=UDim.new(0,3) sdp.PaddingBottom=UDim.new(0,3)
+    rebuildSeedDrop = function()
+        for _,c in ipairs(seedDrop:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+        local seeds=listSeeds()
+        if #seeds==0 then
+            local none=mkButton(seedDrop,"(no seeds in bag)",C.row,UDim2.new(1,0,0,26),UDim2.new()) none.ZIndex=51 none.AutoButtonColor=false
+        else
+            for i,s in ipairs(seeds) do
+                local opt=mkButton(seedDrop,("%s  x%d"):format(s.label,s.qty),C.row,UDim2.new(1,0,0,26),UDim2.new())
+                opt.ZIndex=51 opt.LayoutOrder=i opt.TextXAlignment=Enum.TextXAlignment.Left
+                local op=Instance.new("UIPadding",opt) op.PaddingLeft=UDim.new(0,8)
+                opt.MouseButton1Click:Connect(function()
+                    selectedSeed=s seedBtn.Text="v "..s.label.."  x"..s.qty seedDrop.Visible=false updateInfo()
+                    setStatus("Seed: "..s.label.." ("..(growTimeFor(s.seedName) and (fmtT(growTimeFor(s.seedName)).." grow") or "grow time ?")..")")
+                end)
+            end
+        end
+        seedDrop.Size=UDim2.fromOffset(200, math.max(8,(#seeds>0 and #seeds or 1)*28+6))
+    end
+    seedBtn.MouseButton1Click:Connect(function() if not seedDrop.Visible then rebuildSeedDrop() end seedDrop.Visible=not seedDrop.Visible end)
+
+    refreshBtn.MouseButton1Click:Connect(function() rebuildSeedDrop() rebuildGrid() end)
+    clearBtn.MouseButton1Click:Connect(function() assign={} refreshCellStyles() updateInfo() setStatus("Cleared queued tiles.") end)
+    plantBtn.MouseButton1Click:Connect(function()
+        local todo={}
+        for tile,seed in pairs(assign) do if plantable(tile) then table.insert(todo,{tile=tile,seed=seed}) end end
+        if #todo==0 then setStatus("Nothing queued to plant.") return end
+        local capture = { pickup=act.pickup, sell=act.sell, fav=act.fav }
+        task.spawn(function()
+            local done=0
+            for _,e in ipairs(todo) do
+                PlantSeed:FireServer(e.seed.seedName, e.seed.colors, tileToPos(e.tile))
+                active[e.tile] = { label=e.seed.label, plantedAt=os.clock(), growTime=growTimeFor(e.seed.seedName),
+                                   pickup=capture.pickup, sell=capture.sell, fav=capture.fav }
+                assign[e.tile]=nil
+                done=done+1
+                setStatus(("Planting %s %d/%d"):format(e.seed.label,done,#todo))
+                task.wait(0.3)
+            end
+            setStatus(("Planted %d."):format(done))
+            task.wait(0.4)
+            rebuildSeedDrop() rebuildGrid()
+        end)
+    end)
+
+    -- grow completion straight from the server: placed plants carry an absolute
+    -- "CompletionTime" attribute. This is authoritative and works even when the
+    -- registry grow-time lookup misses (which is what had broken auto-pickup).
+    local CS2 = game:GetService("CollectionService")
+    local function nowTime()
+        local ok2,t = pcall(function() return workspace:GetServerTimeNow() end)
+        if ok2 and type(t)=="number" and t>1e9 then return t end
+        return os.time()
+    end
+    local function completionAtTile(tile)
+        for _,tag in ipairs({"Plants","Plant"}) do
+            for _,p in ipairs(CS2:GetTagged(tag)) do
+                local ct = tonumber(p:GetAttribute("CompletionTime"))
+                if ct and ct>1e9 then
+                    local own = p:GetAttribute("Owner")
+                    if own==nil or own==LocalPlayer.UserId then
+                        local pos
+                        if p:IsA("Model") then local ok3,c=pcall(function() return p:GetPivot().Position end) if ok3 then pos=c end
+                        elseif p:IsA("BasePart") then pos=p.Position end
+                        if pos then
+                            local dx,dz = pos.X-tile.Position.X, pos.Z-tile.Position.Z
+                            if (dx*dx+dz*dz) < 16 then return ct end
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+    task.spawn(function()
+        while plantTab.Parent do
+            local grown={}
+            for tile,a in pairs(active) do
+                if a.completion==nil then a.completion = completionAtTile(tile) end
+                local rem
+                if a.completion then rem = a.completion - nowTime()
+                elseif a.growTime then rem = a.growTime-(os.clock()-a.plantedAt)
+                else rem = nil end
+                local cell=cells[tile]
+                if cell and cell.timer then
+                    cell.timer.Text = (rem==nil) and "grow" or (rem>0 and fmtT(rem) or "done")
+                end
+                if rem~=nil and rem<=0 and not a.done then table.insert(grown,{tile=tile,a=a}) end
+            end
+            for _,g in ipairs(grown) do handleGrown(g.tile,g.a) end
+            task.wait(0.5)
+        end
+    end)
+
+    local prev = onTabShown
+    onTabShown = function(name)
+        if prev then prev(name) end
+        if name=="Plant" then rebuildSeedDrop() rebuildGrid() end
+    end
+end
+
+----------------------------------------------------------------------
+--  BUY TAB  (auto-buy seeds / gear on restock)
+----------------------------------------------------------------------
+do
+    local Remotes = RS:WaitForChild("Remotes")
+    local BuyItem = Remotes:WaitForChild("BuyItem")
+    local BuyGear = Remotes:WaitForChild("BuyGear")
+    local SEEDS   = RS:WaitForChild("Assets"):WaitForChild("Seeds")
+    local GEARS   = RS.Assets:WaitForChild("Gears")
+
+    -- DEFAULT: auto-buy on, seeds + gear on
+    local cfg = { enabled=true, buySeeds=true, buyGears=true, buyDelay=0.45 }
+    local busy=false
+
+    local function buyFolder(folder, remote)
+        local bought=false
+        for _,item in ipairs(folder:GetChildren()) do
+            if not cfg.enabled then return bought end
+            if (item:GetAttribute("Stock") or 0) > 0 then
+                remote:FireServer(item.Name, false)
+                setStatus("buying "..item.Name)
+                bought=true
+                task.wait(cfg.buyDelay)
+            end
+        end
+        return bought
+    end
+    local function runPass()
+        if busy or not cfg.enabled then return end
+        busy=true
+        local again=true
+        while again and cfg.enabled do
+            again=false
+            if cfg.buySeeds and buyFolder(SEEDS, BuyItem) then again=true end
+            if cfg.buyGears and buyFolder(GEARS, BuyGear) then again=true end
+        end
+        busy=false
+        if cfg.enabled then setStatus("auto-buy: waiting for restock") end
+    end
+
+    for _,name in ipairs({"UpdatePlantStocks","UpdStock","SetSeedStock","UpdateGearStocks","UpdGearStock","Restock"}) do
+        local r=Remotes:FindFirstChild(name)
+        if r and r:IsA("RemoteEvent") then r.OnClientEvent:Connect(function() task.spawn(runPass) end) end
+    end
+    task.spawn(function() while true do task.wait(2.5) runPass() end end)
+
+    local y=0
+    local function row(h) local r=Instance.new("Frame",buyTab) r.BackgroundTransparency=1 r.Size=UDim2.new(1,0,0,h) r.Position=UDim2.fromOffset(0,y) y=y+h+6 return r end
+    local function toggle(text,key,onChange)
+        local r=row(26) local b=mkButton(r,"",C.row,UDim2.new(1,0,1,0),UDim2.new()) b.AutoButtonColor=true
+        mkLabel(b,text,UDim2.new(1,-44,1,0),UDim2.fromOffset(8,0),C.txt,Enum.Font.Gotham,13)
+        local pip=mkLabel(b,"",UDim2.fromOffset(34,18),UDim2.new(1,-40,0.5,-9),Color3.new(1,1,1),Enum.Font.GothamBold,11)
+        pip.TextXAlignment=Enum.TextXAlignment.Center corner(pip,5)
+        local function rf() pip.Text=cfg[key] and "ON" or "OFF" pip.BackgroundColor3=cfg[key] and C.green or C.grey end
+        b.MouseButton1Click:Connect(function() cfg[key]=not cfg[key] rf() if onChange then onChange() end end) rf()
+    end
+
+    mkLabel(buyTab,"Auto-Buy",UDim2.new(1,0,0,18),UDim2.new(),C.txt,Enum.Font.GothamBold,14) y=22
+    toggle("Enabled","enabled",function() if cfg.enabled then setStatus("auto-buy on") task.spawn(runPass) else setStatus("auto-buy off") end end)
+    toggle("Buy seeds","buySeeds")
+    toggle("Buy gear","buyGears")
+    mkLabel(buyTab,"Buys anything in stock the moment the shop restocks. On by default.",
+        UDim2.new(1,0,0,30),UDim2.fromOffset(0,y),C.dim,Enum.Font.Gotham,11).TextWrapped=true
+end
+
+----------------------------------------------------------------------
+--  EVENT TAB  (Investment Week autopilot - one button)
+----------------------------------------------------------------------
+do
+    local Interact = RS:WaitForChild("Remotes"):WaitForChild("Events"):WaitForChild("Investment"):WaitForChild("Interact")
+    local ItemSell = RS.Remotes:WaitForChild("ItemSell")
+    local FavoriteItem = RS.Remotes:WaitForChild("FavoriteItem")
+    local PLANT_NAME = "Cactus"
+    local SUBMIT_MAX = 9
+    local SELL_KG    = 9.5
+    local MAX_KG     = 10
+    local COOLDOWN   = 90
+    local INVEST_DELAY = 0.10
+    local MAX_ERRORS = 15
+
+    local function findEventModel()
+        for _,m in ipairs(workspace:GetDescendants()) do
+            if m:IsA("Model") and m:FindFirstChild("PlantPrompt") and m:FindFirstChild("MoneyPrompt") then return m end
+        end
+    end
+    local model
+    local PlayerData
+    pcall(function() PlayerData = require(RS:WaitForChild("PlayerData")) end)
+
+    local function readPlant()
+        if PlayerData then
+            local ok2,ip = pcall(function() return PlayerData:GetData().Data.InvestmentPlant end)
+            if ok2 then
+                if ip==nil then return false,0 end
+                return true, tonumber(ip.Size) or 0
+            end
+        end
+        local pf = model and model:FindFirstChild("PlantFolder")
+        return (pf~=nil and #pf:GetChildren()>0), 0
+    end
+    local function isPlaced() local p=readPlant() return p end
+    local function favorited(id)
+        if PlayerData then
+            local ok2,fav = pcall(function() return PlayerData:GetData().Data.Favorites end)
+            if ok2 and type(fav)=="table" then local f=fav[id] return f~=nil and f~=false end
+        end
+        return false
+    end
+    local function claimable()
+        if not model then return false end
+        for _,d in ipairs(model:GetDescendants()) do
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and type(d.Text)=="string" then
+                local t=d.Text:lower()
+                if t:find("max investment") or t:find("max size") or t:find("claim your") then return true end
+            end
+        end
+        return false
+    end
+    local function getFeedTool()
+        local best,bsz
+        for _,c in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+            if c then for _,tl in ipairs(c:GetChildren()) do
+                if tl:IsA("Tool") and (tl.Name==PLANT_NAME or tl:GetAttribute("PlantName")==PLANT_NAME) then
+                    local sz=tonumber(tl:GetAttribute("Size")) or 0
+                    if sz<SUBMIT_MAX and (not bsz or sz<bsz) then best,bsz=tl,sz end
+                end
+            end end
+        end
+        return best
+    end
+    local function equip(tool)
+        local char=LocalPlayer.Character local hum=char and char:FindFirstChildOfClass("Humanoid")
+        if not (tool and hum) then return false end
+        hum:EquipTool(tool)
+        local t=0 while tool.Parent~=char and t<1 do task.wait(0.03) t+=0.03 end
+        return true
+    end
+    local function ensureFeedEquipped()
+        local char=LocalPlayer.Character local held=char and char:FindFirstChildWhichIsA("Tool")
+        if held and (held.Name==PLANT_NAME or held:GetAttribute("PlantName")==PLANT_NAME)
+           and (tonumber(held:GetAttribute("Size")) or 0)<SUBMIT_MAX then return true end
+        return equip(getFeedTool())
+    end
+    local function sellOutputs()
+        for _=1,20 do
+            local target
+            for _,c in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+                if c then for _,tl in ipairs(c:GetChildren()) do
+                    if tl:IsA("Tool") and (tl.Name==PLANT_NAME or tl:GetAttribute("PlantName")==PLANT_NAME) then
+                        if (tonumber(tl:GetAttribute("Size")) or 0) >= SELL_KG then target=tl break end
+                    end
+                end end
+                if target then break end
+            end
+            if not target then break end
+            local id=target:GetAttribute("ID")
+            for _=1,3 do
+                if id and favorited(id) then FavoriteItem:FireServer(id) task.wait(0.2) else break end
+            end
+            if equip(target) then
+                ItemSell:FireServer(true) task.wait(0.25)
+                local hum=LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then pcall(function() hum:UnequipTools() end) end
+            end
+            task.wait(0.15)
+            if target.Parent then break end
+        end
+    end
+    local function closeResetPopup()
+        local pg=LocalPlayer:FindFirstChild("PlayerGui") if not pg then return end
+        for _,lbl in ipairs(pg:GetDescendants()) do
+            if lbl:IsA("TextLabel") and type(lbl.Text)=="string" and lbl.Text:lower():find("reset event") then
+                local f=lbl while f and f.Parent and not f.Parent:IsA("ScreenGui") do f=f.Parent end
+                if f then pcall(function() f.Visible=false end) end return
+            end
+        end
+    end
+
+    local resetWanted,consecErrors=false,0
+    Interact.OnClientEvent:Connect(function(action)
+        if action=="ResetPrompt" then resetWanted=true
+        elseif action=="Grow" then consecErrors=0
+        elseif action=="Error" then consecErrors+=1 end
+    end)
+
+    local function claimAndSell()
+        Interact:FireServer("AttemptPickupPlant")
+        local t=0
+        while isPlaced() and t<5 do
+            task.wait(0.25) t+=0.25
+            if t==1.5 and isPlaced() then Interact:FireServer("AttemptPickupPlant") end
+        end
+        consecErrors=0
+        task.wait(0.3)
+        sellOutputs()
+        setStatus("event: claimed + sold output")
+    end
+
+    local function loop()
+        model = findEventModel()
+        if not model then setStatus("event: booth not found (active?)") getgenv().InvestRun=false return end
+        local cooldownUntil,lastPlaced=0,false
+        while getgenv().InvestRun do
+            local placed,size=readPlant()
+            if (not placed) and lastPlaced then cooldownUntil=os.clock()+COOLDOWN end
+            lastPlaced=placed
+            if placed then
+                if size>=MAX_KG-0.1 or claimable() then claimAndSell()
+                elseif resetWanted then
+                    Interact:FireServer("Reset") task.wait(0.15) closeResetPopup()
+                    resetWanted=false consecErrors=0 setStatus("event: round full - reset")
+                elseif consecErrors>=MAX_ERRORS then claimAndSell()
+                else Interact:FireServer("IncrementMoney") task.wait(INVEST_DELAY) end
+            else
+                if os.clock()<cooldownUntil then task.wait(1)
+                elseif ensureFeedEquipped() then Interact:FireServer("AttemptAddPlant") task.wait(1.5)
+                else setStatus("event: no small '"..PLANT_NAME.."' to feed") task.wait(3) end
+            end
+        end
+        setStatus("event: stopped")
+    end
+
+    mkLabel(eventTab,"Investment Week",UDim2.new(1,0,0,18),UDim2.new(),C.txt,Enum.Font.GothamBold,14)
+    local startBtn=mkButton(eventTab,"Start",C.green,UDim2.fromOffset(120,30),UDim2.fromOffset(0,28))
+    local running=false
+    startBtn.MouseButton1Click:Connect(function()
+        running=not running
+        if running then
+            startBtn.Text="Stop" startBtn.BackgroundColor3=C.red
+            getgenv().InvestRun=true setStatus("event: running")
+            task.spawn(loop)
+        else
+            startBtn.Text="Start" startBtn.BackgroundColor3=C.green
+            getgenv().InvestRun=false
+        end
+    end)
+    mkLabel(eventTab,"Feeds the smallest Cactus, maxes it, claims, sells the 10kg output, repeats on the 90s cooldown. Off by default; temporary event tab.",
+        UDim2.new(1,0,0,70),UDim2.fromOffset(0,66),C.dim,Enum.Font.Gotham,11).TextWrapped=true
+end
+
+----------------------------------------------------------------------
+--  MISC TAB
+----------------------------------------------------------------------
+do
+    local TheWheelSpin
+    pcall(function() TheWheelSpin = RS:WaitForChild("Remotes"):WaitForChild("Cards"):WaitForChild("TheWheelSpin") end)
+
+    -- is The Wheel card in the equipped deck? (Data.Cards.Equipped -> Inventory[guid].Type)
+    local PDw pcall(function() PDw = require(RS:WaitForChild("PlayerData")) end)
+    local function wheelEquipped()
+        local ok2,d = pcall(function() return PDw and PDw:GetDataAsync() end)
+        if ok2 and d and type(d.Cards)=="table" and type(d.Cards.Equipped)=="table" and type(d.Cards.Inventory)=="table" then
+            for _,guid in pairs(d.Cards.Equipped) do
+                local e = guid and d.Cards.Inventory[guid]
+                if e and tostring(e.Type):lower():gsub("[^%a%d]","")=="thewheel" then return true end
+            end
+        end
+        return false
+    end
+
+    mkLabel(miscTab,"Misc",UDim2.new(1,0,0,18),UDim2.new(),C.txt,Enum.Font.GothamBold,14)
+
+    -- wheel auto-spin: ON by default, but only fires when the wheel is equipped
+    local spinBtn = mkButton(miscTab,"Wheel auto-spin: ON",C.green,UDim2.fromOffset(210,28),UDim2.fromOffset(0,26))
+    if getgenv().PvBWheelSpin==nil then getgenv().PvBWheelSpin=true end
+    local function rfSpin()
+        local on=getgenv().PvBWheelSpin
+        spinBtn.Text="Wheel auto-spin: "..(on and "ON" or "OFF")
+        spinBtn.BackgroundColor3 = on and C.green or C.grey
+    end
+    spinBtn.MouseButton1Click:Connect(function()
+        getgenv().PvBWheelSpin=not getgenv().PvBWheelSpin rfSpin()
+        setStatus("Wheel auto-spin "..(getgenv().PvBWheelSpin and "on" or "off"))
+    end) rfSpin()
+    task.spawn(function()
+        while true do
+            task.wait(30)
+            if getgenv().PvBWheelSpin and TheWheelSpin and wheelEquipped() then
+                pcall(function() TheWheelSpin:FireServer() end)
+            end
+        end
+    end)
+    mkLabel(miscTab,"Spins the Wheel card every 30s, but only while The Wheel is actually in your equipped deck. Reward is server-rolled, so it can't be biased.",
+        UDim2.new(1,0,0,72),UDim2.fromOffset(0,62),C.dim,Enum.Font.Gotham,11).TextWrapped=true
+
+    -- open/close the stats window (created lower; exposed via getgenv, hidden by default)
+    local statsBtn = mkButton(miscTab,"Open stats window",C.blue,UDim2.fromOffset(210,28),UDim2.fromOffset(0,140))
+    statsBtn.MouseButton1Click:Connect(function()
+        local f=getgenv().PvBStatsFrame
+        if not f then setStatus("Stats window not ready yet.") return end
+        f.Visible = not f.Visible
+        statsBtn.Text = f.Visible and "Close stats window" or "Open stats window"
+        statsBtn.BackgroundColor3 = f.Visible and C.purple or C.blue
+        setStatus("Stats window "..(f.Visible and "opened" or "closed"))
+    end)
+    mkLabel(miscTab,"Opens the auto-tracking stats window. Configs are detected automatically from your equipped cards, active potions, and server luck.",
+        UDim2.new(1,0,0,72),UDim2.fromOffset(0,174),C.dim,Enum.Font.Gotham,11).TextWrapped=true
+end
+
+----------------------------------------------------------------------
+--  STATS PANEL  (separate window, opened from the Misc tab)
+--  Auto-detects your config from equipped cards (+tier), active potions,
+--  and server luck, then logs brainrot spawn stats under that config.
+--  Re-checks the config every 15s and switches on its own. Configs are
+--  deletable. Hidden by default. Persists to .PvBStats/stats.json.
+----------------------------------------------------------------------
+do
+    local PD
+    pcall(function() PD = require(RS:WaitForChild("PlayerData")) end)
+    local LANE  = workspace:WaitForChild("ScriptedMap"):WaitForChild("MissionBrainrots")
+    local BP    = LocalPlayer:WaitForChild("Backpack")
+
+    local DATA
+    local function refreshData() pcall(function() DATA = PD and PD:GetDataAsync() or DATA end) end
+    refreshData()
+
+    local DIR, FILE = ".PvBStats", ".PvBStats/stats.json"
+    local canWrite = (type(writefile)=="function" and type(readfile)=="function")
+    local canFS    = (type(isfile)=="function" and type(isfolder)=="function" and type(makefolder)=="function")
+    if canFS and not isfolder(DIR) then pcall(makefolder,DIR) end
+
+    local activeMode = "none"
+    local buckets    = {}
+    local order      = {}
+    local winW, winH = 400, 420
+    local dirty = false
+
+    ---------- config detection ----------
+    -- matched as substrings of the normalized Type, so apostrophes / extra words
+    -- (e.g. "Alchemist's Expertise") and "The"/"Collection" parts don't matter
+    local CARD_WL = {
+        { root="secret",    disp="Secret" },
+        { root="forbidden", disp="Forbidden" },
+        { root="wheel",     disp="Wheel" },
+        { root="weighted",  disp="Weighted" },
+        { root="flashmob",  disp="FlashMob" },
+        { root="alchemist", disp="Alchemist" },
+        { root="trick",     disp="TrickOrTreat" },
+    }
+    -- matched as substrings of the normalized key, so "Riot Potion",
+    -- "Pine Tree Potion", "Pre-Workout" etc. all match regardless of suffix/spacing
+    local POTION_WL = {
+        { root="riot",    disp="Riot" },
+        { root="biggify", disp="Biggify" },
+        { root="pine",    disp="Pine" },
+        { root="workout", disp="PreWorkout" },
+    }
+    local function norm(s) return tostring(s):lower():gsub("[^%a%d]","") end
+    local function potionDisp(nameNorm)
+        for _,e in ipairs(POTION_WL) do
+            if nameNorm:find(e.root, 1, true) then return e.disp end
+        end
+        return nil
+    end
+    local function cardDisp(nameNorm)
+        for _,e in ipairs(CARD_WL) do
+            if nameNorm:find(e.root, 1, true) then return e.disp end
+        end
+        return nil
+    end
+
+    local function equippedCards()
+        local out={}
+        local d=DATA
+        if d and type(d.Cards)=="table" and type(d.Cards.Equipped)=="table" and type(d.Cards.Inventory)=="table" then
+            for _,guid in pairs(d.Cards.Equipped) do
+                local e = guid and d.Cards.Inventory[guid]
+                if e then
+                    local disp=cardDisp(norm(tostring(e.Type)))
+                    if disp then
+                        local tier=(type(e.Data)=="table" and tonumber(e.Data.Tier)) or 1
+                        out[#out+1]=disp.."T"..tier
+                    end
+                end
+            end
+        end
+        table.sort(out) return out
+    end
+    local function activePotions()
+        local out={}
+        local d=DATA
+        if d and type(d.Potions)=="table" then
+            for name,v in pairs(d.Potions) do
+                local left = (type(v)=="number" and v)
+                    or (type(v)=="table" and tonumber(v.TimeLeft or v.Time or v.Duration or v.Seconds)) or 1
+                if (left or 0)>0 then
+                    local disp=potionDisp(norm(tostring(name)))
+                    if disp then out[#out+1]=disp end
+                end
+            end
+        end
+        table.sort(out) return out
+    end
+    -- any active potion key we did NOT recognize (so a missed one stays visible)
+    local function unmatchedPotions()
+        local out={}
+        local d=DATA
+        if d and type(d.Potions)=="table" then
+            for name,v in pairs(d.Potions) do
+                local left=(type(v)=="number" and v) or (type(v)=="table" and tonumber(v.TimeLeft or v.Time or v.Duration or v.Seconds)) or 1
+                if (left or 0)>0 and not potionDisp(norm(tostring(name))) then out[#out+1]=tostring(name) end
+            end
+        end
+        table.sort(out) return out
+    end
+    -- equipped cards we did NOT recognize (shows the raw .Type so we can map it)
+    local function unmatchedCards()
+        local out={}
+        local d=DATA
+        if d and type(d.Cards)=="table" and type(d.Cards.Equipped)=="table" and type(d.Cards.Inventory)=="table" then
+            for _,guid in pairs(d.Cards.Equipped) do
+                local e = guid and d.Cards.Inventory[guid]
+                if e and not cardDisp(norm(tostring(e.Type))) then out[#out+1]=tostring(e.Type) end
+            end
+        end
+        table.sort(out) return out
+    end
+    -- admin server luck: workspace attribute "ServerLuck" (number, shown as Nx)
+    local function serverLuck()
+        local v=tonumber(workspace:GetAttribute("ServerLuck"))
+        if v and v>1.0001 then
+            local s = (v%1==0) and tostring(math.floor(v)) or tostring(math.floor(v*10+0.5)/10)
+            return "Luck"..s.."x"
+        end
+        return nil
+    end
+    local function configKey()
+        local seg={}
+        local c=equippedCards() local p=activePotions() local luck=serverLuck()
+        if #c>0 then seg[#seg+1]=table.concat(c,"+") end
+        if #p>0 then seg[#seg+1]=table.concat(p,"+") end
+        if luck then seg[#seg+1]=luck end
+        if #seg==0 then return "none" end
+        return table.concat(seg," | ")
+    end
+
+    local function curKey() return activeMode or "none" end
+    local function bucket(k)
+        local b=buckets[k]
+        if not b then
+            b={spawns=0,sizeSum=0,sizeCount=0,sizeMin=math.huge,sizeMax=0,span=0,lastT=nil,millions=0,rar={}}
+            buckets[k]=b order[#order+1]=k dirty=true
+        end
+        return b
+    end
+
+    ---------- persistence ----------
+    local function loadSaved()
+        if not canWrite then return end
+        if canFS and not isfile(FILE) then return end
+        local ok,raw = pcall(readfile,FILE) if not ok or not raw or #raw==0 then return end
+        local ok2,t = pcall(function() return HttpService:JSONDecode(raw) end)
+        if not ok2 or type(t)~="table" then return end
+        if type(t.order)=="table" then for _,k in ipairs(t.order) do order[#order+1]=tostring(k) end end
+        if type(t.activeMode)=="string" then activeMode=t.activeMode end
+        if type(t.win)=="table" then winW=tonumber(t.win.w) or winW winH=tonumber(t.win.h) or winH end
+        if type(t.buckets)=="table" then
+            for k,b in pairs(t.buckets) do
+                buckets[k]={ spawns=b.spawns or 0, sizeSum=b.sizeSum or 0, sizeCount=b.sizeCount or 0,
+                    sizeMin=((b.sizeCount or 0)>0 and (b.sizeMin or 0)) or math.huge,
+                    sizeMax=b.sizeMax or 0, span=b.span or 0, lastT=nil,
+                    millions=b.millions or 0, rar=(type(b.rar)=="table" and b.rar or {}) }
+                if not table.find(order,k) then order[#order+1]=k end
+            end
+        end
+    end
+    local function snap()
+        local out={ v=3, order=order, activeMode=activeMode, win={w=winW,h=winH}, buckets={} }
+        for k,b in pairs(buckets) do
+            out.buckets[k]={ spawns=b.spawns, sizeSum=b.sizeSum, sizeCount=b.sizeCount,
+                sizeMin=(b.sizeCount>0 and b.sizeMin or 0), sizeMax=b.sizeMax, span=b.span,
+                millions=b.millions, rar=b.rar }
+        end
+        return out
+    end
+    local function saveNow()
+        if not canWrite then return end
+        local ok,j=pcall(function() return HttpService:JSONEncode(snap()) end)
+        if ok then pcall(writefile,FILE,j) dirty=false end
+    end
+    loadSaved()
+
+    ---------- brainrot stream ----------
+    local seen={}
+    local function logSpawn(m)
+        if not m:IsA("Model") or seen[m] then return end seen[m]=true
+        task.spawn(function()
+            local size=m:GetAttribute("Size") local t0=os.clock()
+            while size==nil and os.clock()-t0<3 do task.wait() size=m:GetAttribute("Size") end
+            local rarity=m:GetAttribute("Rarity") or "?"
+            local b=bucket(curKey())
+            local now=os.clock()
+            if b.lastT then b.span=b.span+math.min(now-b.lastT,10) end
+            b.lastT=now b.spawns+=1
+            if size then b.sizeSum+=size b.sizeCount+=1 b.sizeMin=math.min(b.sizeMin,size) b.sizeMax=math.max(b.sizeMax,size) end
+            b.rar[rarity]=(b.rar[rarity] or 0)+1
+            dirty=true
+        end)
+    end
+    for _,m in ipairs(LANE:GetChildren()) do logSpawn(m) end
+    LANE.ChildAdded:Connect(logSpawn)
+
+    -- count each 1M+ brainrot only once, keyed by its unique ID, so pulling one
+    -- out of the hotbar and back into the bag can't re-count it
+    local countedMillion = {}
+    BP.ChildAdded:Connect(function(t)
+        if t:IsA("Tool") and t:GetAttribute("ID") and not t:GetAttribute("PlantName") then
+            local id=t:GetAttribute("ID")
+            task.delay(0.3,function()
+                if id and not countedMillion[id] and (tonumber(t:GetAttribute("Worth")) or 0) >= 1000000 then
+                    countedMillion[id]=true
+                    bucket(curKey()).millions+=1 dirty=true
+                end
+            end)
+        end
+    end)
+
+    ---------- window ----------
+    local sp=Instance.new("Frame") sp.Name="PvBStatsPanel"
+    sp.Size=UDim2.fromOffset(winW,winH) sp.Position=UDim2.fromOffset(480,50)
+    sp.BackgroundColor3=C.bg sp.BackgroundTransparency=0.05 sp.BorderSizePixel=0 sp.Visible=false sp.Parent=gui
+    corner(sp,12) do local s=Instance.new("UIStroke",sp) s.Thickness=1 s.Color=C.stroke s.Transparency=0.4 end
+    getgenv().PvBStatsFrame = sp   -- Misc tab toggles this
+
+    local header=Instance.new("Frame",sp) header.BackgroundTransparency=1 header.Size=UDim2.new(1,0,0,30) header.Position=UDim2.new() header.ZIndex=1
+    mkLabel(header,"PvB Stats (auto)",UDim2.fromOffset(180,22),UDim2.fromOffset(14,6),C.txt,Enum.Font.GothamBold,15)
+    local resetBtn=mkButton(sp,"Reset",C.grey,UDim2.fromOffset(54,22),UDim2.new(1,-172,0,6)) resetBtn.ZIndex=5
+    local copyBtn =mkButton(sp,"Copy",C.blue,UDim2.fromOffset(54,22),UDim2.new(1,-114,0,6)) copyBtn.ZIndex=5
+    local minB    =mkButton(sp,"-",C.grey,UDim2.fromOffset(48,22),UDim2.new(1,-56,0,6)) minB.Font=Enum.Font.GothamBold minB.TextSize=16 minB.ZIndex=5
+
+    local cfgList=Instance.new("ScrollingFrame",sp) cfgList.Size=UDim2.new(1,-16,0,96) cfgList.Position=UDim2.fromOffset(8,36)
+    cfgList.BackgroundColor3=C.panel cfgList.BackgroundTransparency=0.3 cfgList.BorderSizePixel=0
+    cfgList.ScrollBarThickness=5 cfgList.CanvasSize=UDim2.new() cfgList.AutomaticCanvasSize=Enum.AutomaticSize.Y corner(cfgList,6)
+    local cll=Instance.new("UIListLayout",cfgList) cll.Padding=UDim.new(0,3) cll.SortOrder=Enum.SortOrder.LayoutOrder
+    local clp=Instance.new("UIPadding",cfgList) clp.PaddingTop=UDim.new(0,3) clp.PaddingLeft=UDim.new(0,3) clp.PaddingRight=UDim.new(0,3)
+
+    local scroller=Instance.new("ScrollingFrame",sp) scroller.Size=UDim2.new(1,-16,1,-148) scroller.Position=UDim2.fromOffset(8,140)
+    scroller.BackgroundColor3=C.panel scroller.BackgroundTransparency=0.15 scroller.BorderSizePixel=0
+    scroller.ScrollBarThickness=6 scroller.CanvasSize=UDim2.new() scroller.AutomaticCanvasSize=Enum.AutomaticSize.Y corner(scroller,8)
+    local bodyLbl=Instance.new("TextLabel",scroller) bodyLbl.BackgroundTransparency=1 bodyLbl.Size=UDim2.new(1,-16,0,10)
+    bodyLbl.AutomaticSize=Enum.AutomaticSize.Y bodyLbl.Position=UDim2.fromOffset(8,6)
+    bodyLbl.Font=Enum.Font.Gotham bodyLbl.TextSize=13 bodyLbl.TextColor3=C.txt bodyLbl.RichText=true
+    bodyLbl.LineHeight=1.15 bodyLbl.TextWrapped=true
+    bodyLbl.TextXAlignment=Enum.TextXAlignment.Left bodyLbl.TextYAlignment=Enum.TextYAlignment.Top bodyLbl.Text=""
+
+    local grip=mkButton(sp,"",Color3.fromRGB(90,90,100),UDim2.fromOffset(18,18),UDim2.new(1,-20,1,-20)) grip.AutoButtonColor=false grip.ZIndex=10
+    do local t=mkLabel(grip,"//",UDim2.new(1,0,1,0),UDim2.new(),Color3.new(1,1,1),Enum.Font.GothamBold,10) t.TextXAlignment=Enum.TextXAlignment.Center t.ZIndex=11 end
+
+    local function delConfig(label)
+        buckets[label]=nil
+        local i=table.find(order,label) if i then table.remove(order,i) end
+        if activeMode==label then activeMode="none" end
+        dirty=true saveNow()
+    end
+    local rebuildConfigs
+    rebuildConfigs=function()
+        for _,c in ipairs(cfgList:GetChildren()) do if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end end
+        local o=0
+        local function chip(label)
+            o=o+1
+            local rowf=Instance.new("Frame",cfgList) rowf.Size=UDim2.new(1,-6,0,24) rowf.BackgroundTransparency=1 rowf.LayoutOrder=o
+            local isActive = (label==activeMode)
+            local sel=mkButton(rowf,(isActive and "* " or "")..label, isActive and C.green or C.row, UDim2.new(1,-26,1,0),UDim2.new())
+            sel.TextXAlignment=Enum.TextXAlignment.Left sel.TextSize=11 local p=Instance.new("UIPadding",sel) p.PaddingLeft=UDim.new(0,8)
+            sel.AutoButtonColor=false sel.TextTruncate=Enum.TextTruncate.AtEnd
+            local x=mkButton(rowf,"x",C.red,UDim2.fromOffset(22,24),UDim2.new(1,-22,0,0))
+            x.MouseButton1Click:Connect(function() delConfig(label) rebuildConfigs() end)
+        end
+        local shown={}
+        if activeMode and not table.find(order,activeMode) then chip(activeMode) shown[activeMode]=true end
+        for _,k in ipairs(order) do if not shown[k] then chip(k) shown[k]=true end end
+        if o==0 then mkLabel(cfgList,"(detecting config...)",UDim2.new(1,-6,0,22),UDim2.new(),C.dim,Enum.Font.Gotham,12) end
+    end
+    rebuildConfigs()
+
+    local function applyLayout(h)
+        local hidden = h<=60
+        cfgList.Visible=not hidden scroller.Visible=not hidden grip.Visible=not hidden
+    end
+    local minimized=false
+    minB.MouseButton1Click:Connect(function()
+        minimized=not minimized
+        if minimized then sp.Size=UDim2.fromOffset(winW,40) applyLayout(40)
+        else sp.Size=UDim2.fromOffset(winW,winH) applyLayout(winH) end
+    end)
+    resetBtn.MouseButton1Click:Connect(function()
+        buckets={} order={} dirty=true saveNow() rebuildConfigs() setStatus("Stats reset.")
+    end)
+    copyBtn.MouseButton1Click:Connect(function()
+        local ok,j=pcall(function() return HttpService:JSONEncode(snap()) end)
+        if ok and type(setclipboard)=="function" then setclipboard(j) setStatus("Stats JSON copied.")
+        elseif ok and type(toclipboard)=="function" then toclipboard(j) setStatus("Stats JSON copied.")
+        else setStatus("Clipboard n/a; saved to "..FILE) end
+    end)
+
+    local drag={a=false} local rez={a=false}
+    header.InputBegan:Connect(function(io) if io.UserInputType==Enum.UserInputType.MouseButton1 then drag.a=true drag.s=io.Position drag.base=sp.Position end end)
+    grip.InputBegan:Connect(function(io) if io.UserInputType==Enum.UserInputType.MouseButton1 then rez.a=true rez.s=io.Position rez.base=sp.AbsoluteSize end end)
+    UIS.InputChanged:Connect(function(io)
+        if io.UserInputType~=Enum.UserInputType.MouseMovement then return end
+        if drag.a then local d=io.Position-drag.s
+            sp.Position=UDim2.new(drag.base.X.Scale,drag.base.X.Offset+d.X,drag.base.Y.Scale,drag.base.Y.Offset+d.Y)
+        elseif rez.a then local d=io.Position-rez.s
+            winW=math.max(300,math.floor(rez.base.X+d.X)) winH=math.max(200,math.floor(rez.base.Y+d.Y))
+            if not minimized then sp.Size=UDim2.fromOffset(winW,winH) end
+        end
+    end)
+    UIS.InputEnded:Connect(function(io) if io.UserInputType==Enum.UserInputType.MouseButton1 then
+        if rez.a then dirty=true saveNow() end drag.a=false rez.a=false end end)
+
+    ---------- render ----------
+    local LBL = 'rgb(150,150,162)'   -- dim label colour
+    local function render()
+        local keys={} for k in pairs(buckets) do keys[#keys+1]=k end
+        table.sort(keys, function(a,b)
+            if a==activeMode and b~=activeMode then return true end
+            if b==activeMode and a~=activeMode then return false end
+            return a<b
+        end)
+        if #keys==0 then bodyLbl.Text="waiting for spawns..." return end
+        local lines={}
+        for _,k in ipairs(keys) do
+            local b=buckets[k]
+            local avg  = b.sizeCount>0 and (b.sizeSum/b.sizeCount*10) or 0
+            local rate = b.spawns/math.max(1,b.span)
+            local mn   = (b.sizeMin==math.huge and 0 or b.sizeMin*10)
+            local mx   = b.sizeMax*10
+            local active = (k==activeMode)
+            local title = (active and "> " or "")..k
+            if active then
+                lines[#lines+1]=('<font color="rgb(110,220,165)"><b>%s</b></font>'):format(title)
+            else
+                lines[#lines+1]=('<font color="%s"><b>%s</b></font>'):format(LBL,title)
+            end
+            lines[#lines+1]=('   <font color="%s">spawns</font> %d      <font color="%s">rate</font> %.2f/s'):format(LBL,b.spawns,LBL,rate)
+            lines[#lines+1]=('   <font color="%s">avg</font> %.0f kg   <font color="%s">min</font> %.0f kg   <font color="%s">max</font> %.0f kg   <font color="%s">1M+</font> %d'):format(LBL,avg,LBL,mn,LBL,mx,LBL,b.millions)
+            local rk={} for r in pairs(b.rar) do rk[#rk+1]=r end table.sort(rk)
+            if #rk>0 then
+                local parts={} for _,r in ipairs(rk) do parts[#parts+1]=("%s %d"):format(r,b.rar[r]) end
+                lines[#lines+1]='   <font color="'..LBL..'">'..table.concat(parts,"   ")..'</font>'
+            end
+            lines[#lines+1]=""
+        end
+        local uc=unmatchedCards()
+        if #uc>0 then
+            lines[#lines+1]=('<font color="rgb(190,140,45)">unrecognized equipped cards: %s</font>'):format(table.concat(uc,", "))
+        end
+        local um=unmatchedPotions()
+        if #um>0 then
+            lines[#lines+1]=('<font color="rgb(190,140,45)">unrecognized active potions: %s</font>'):format(table.concat(um,", "))
+        end
+        bodyLbl.Text=table.concat(lines,"\n")
+    end
+
+    ---------- driver ----------
+    task.spawn(function()
+        local tick=0
+        while sp.Parent do
+            refreshData()
+            tick+=1
+            if tick%15==0 then          -- 15s buffer on config re-check
+                local key=configKey()
+                if key~=activeMode then
+                    activeMode=key bucket(key) dirty=true rebuildConfigs()
+                    setStatus("stats: config -> "..key)
+                end
+            end
+            render()
+            if dirty and tick%5==0 then saveNow() end
+            task.wait(1)
+        end
+    end)
+    -- detect the starting config immediately (don't wait the first 15s)
+    task.spawn(function()
+        task.wait(2) refreshData()
+        local key=configKey()
+        activeMode=key bucket(key) rebuildConfigs() render()
+    end)
+    setStatus("Stats panel ready (open from Misc)"..(canWrite and "" or " (no file access)"))
+end
+showTab("Teleport")
+print("PvB Main UI loaded.")
